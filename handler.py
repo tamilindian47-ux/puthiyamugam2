@@ -1,358 +1,509 @@
 import os
-import io
 import cv2
 import base64
 import tempfile
-import subprocess
-import traceback
+import urllib.request
 import numpy as np
-import onnxruntime as ort
+import runpod
 import insightface
 from insightface.app import FaceAnalysis
-from PIL import Image, ImageSequence
-import runpod
 
-INSWAPPER_PATH = os.environ.get("INSWAPPER_PATH", "/app/models/inswapper128.onnx")
-GFPGAN_PATH = os.environ.get("GFPGAN_PATH", "/app/models/GFPGANv1.4.pth")
+print("Worker: Initializing Puthiya Mugam handler...")
 
-CLUSTER_THRESH = 0.45
-MATCH_THRESH = 0.40
-DETECT_SAMPLES = 30
+PROVIDERS = ["CUDAExecutionProvider", "CPUExecutionProvider"]
 
-PROVIDERS = [
-    (
-        "CUDAExecutionProvider",
-        {
-            "device_id": 0,
-            "arena_extend_strategy": "kSameAsRequested",
-            "gpu_mem_limit": 6 * 1024 * 1024 * 1024,
-            "cudnn_conv_algo_search": "HEURISTIC",
-        },
-    ),
-    "CPUExecutionProvider",
-]
+faceapp = FaceAnalysis(name="buffalo_l", providers=PROVIDERS)
+faceapp.prepare(ctx_id=0, det_size=(640, 640))
 
-print("Worker ORT providers:", ort.get_available_providers(), flush=True)
-assert "CUDAExecutionProvider" in ort.get_available_providers(), "CUDA provider missing"
+def find_model_path():
+    candidates = [
+        os.environ.get("SWAPPERPATH"),
+        os.environ.get("INSWAPPERPATH"),
+        "/models/inswapper_128.onnx",
+        "/models/inswapper128.onnx",
+        os.path.expanduser("~/.insightface/models/inswapper_128.onnx"),
+        os.path.expanduser("~/.insightface/models/inswapper128.onnx"),
+        "./inswapper_128.onnx",
+        "./inswapper128.onnx",
+    ]
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    return None
 
-app = FaceAnalysis(
-    name="buffalo_l",
-    providers=PROVIDERS,
-    allowed_modules=["detection", "recognition"],
-)
-app.prepare(ctx_id=0, det_size=(640, 640), det_thresh=0.4)
+SWAPPER_PATH = find_model_path()
+swapper = None
 
-swapper = insightface.model_zoo.get_model(INSWAPPER_PATH, providers=PROVIDERS)
-assert swapper.session.get_providers()[0] == "CUDAExecutionProvider", "Swapper fell back to CPU"
+if SWAPPER_PATH:
+    try:
+        swapper = insightface.modelzoo.get_model(
+            SWAPPER_PATH,
+            download=False,
+            providers=PROVIDERS
+        )
+        print(f"Worker: inswapper loaded from {SWAPPER_PATH}")
+    except Exception as e:
+        print(f"Worker: failed to load inswapper: {e}")
+else:
+    print("Worker: inswapper model not found in expected locations.")
 
-print("Worker Ready on GPU.", flush=True)
+gfpgan_enhancer = None
+try:
+    from gfpgan import GFPGANer
+    gfpgan_path = os.environ.get("GFPGANPATH", "/models/GFPGANv1.4.pth")
+    if os.path.exists(gfpgan_path):
+        gfpgan_enhancer = GFPGANer(
+            model_path=gfpgan_path,
+            upscale=1,
+            arch="clean",
+            channel_multiplier=2,
+            bg_upsampler=None
+        )
+        print("Worker: GFPGAN loaded.")
+except Exception as e:
+    print(f"Worker: GFPGAN unavailable: {e}")
 
-_gfpgan = None
+codeformer_enhancer = None
+try:
+    from basicsr.utils import img2tensor, tensor2img
+    from facelib.utils.face_restoration_helper import FaceRestoreHelper
+    from torchvision.transforms.functional import normalize
+    import torch
+    from collections import OrderedDict
+    from basicsr.archs.rrdbnet_arch import RRDBNet
+    from realesrgan import RealESRGANer
+    from CodeFormer.basicsr.archs.codeformer_arch import CodeFormer
 
-def get_gfpgan():
-    global _gfpgan
-    if _gfpgan is None:
-        try:
-            from gfpgan import GFPGANer
-            _gfpgan = GFPGANer(
-                model_path=GFPGAN_PATH,
-                upscale=1,
-                arch="clean",
-                channel_multiplier=2,
-                bg_upsampler=None,
+    def load_codeformer():
+        global codeformer_enhancer
+        if codeformer_enhancer is not None:
+            return codeformer_enhancer
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        net = CodeFormer(
+            dim_embd=512,
+            codebook_size=1024,
+            n_head=8,
+            n_layers=9,
+            connect_list=["32", "64", "128", "256"]
+        ).to(device)
+
+        ckpt_path = os.environ.get("CODEFORMERPATH", "/models/codeformer.pth")
+        if not os.path.exists(ckpt_path):
+            return None
+
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        if "params_ema" in checkpoint:
+            net.load_state_dict(checkpoint["params_ema"])
+        elif "params" in checkpoint:
+            net.load_state_dict(checkpoint["params"])
+        else:
+            net.load_state_dict(checkpoint)
+        net.eval()
+
+        bg_upsampler = None
+        realesr_path = os.environ.get("REALESRGANPATH", "/models/RealESRGAN_x2plus.pth")
+        if os.path.exists(realesr_path):
+            model = RRDBNet(
+                num_in_ch=3,
+                num_out_ch=3,
+                num_feat=64,
+                num_block=23,
+                num_grow_ch=32,
+                scale=2
             )
-        except Exception as e:
-            print("Worker GFPGAN unavailable:", e, flush=True)
-            _gfpgan = False
-    return _gfpgan
+            bg_upsampler = RealESRGANer(
+                scale=2,
+                model_path=realesr_path,
+                model=model,
+                tile=400,
+                tile_pad=40,
+                pre_pad=0,
+                half=torch.cuda.is_available()
+            )
 
-def b64_to_bytes(s):
-    if "," in s:
-        s = s.split(",", 1)[1]
-    return base64.b64decode(s)
+        codeformer_enhancer = {
+            "device": device,
+            "net": net,
+            "bg_upsampler": bg_upsampler
+        }
+        return codeformer_enhancer
 
-def bytes_to_img(data):
-    return cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+except Exception as e:
+    print(f"Worker: CodeFormer unavailable: {e}")
 
-def img_to_b64(img, ext=".jpg"):
-    ok, buf = cv2.imencode(ext, img)
+def strip_data_uri(value: str) -> str:
+    if not value:
+        return value
+    if "," in value and value.strip().startswith("data:"):
+        return value.split(",", 1)[1]
+    return value.strip()
+
+def resolve_media_to_bytes(media_str: str) -> bytes:
+    if not media_str:
+        return None
+
+    media_str = media_str.strip()
+
+    if media_str.startswith("http://") or media_str.startswith("https://"):
+        req = urllib.request.Request(
+            media_str,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read()
+
+    return base64.b64decode(strip_data_uri(media_str))
+
+def decode_image_bytes(raw_bytes: bytes):
+    if not raw_bytes:
+        return None
+    arr = np.frombuffer(raw_bytes, np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+def extract_first_frame(media_bytes: bytes, is_video: bool):
+    if not is_video:
+        img = decode_image_bytes(media_bytes)
+        if img is not None and getattr(img, "size", 0) > 0:
+            return img
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            tmp.write(media_bytes)
+            tmp_path = tmp.name
+
+        cap = cv2.VideoCapture(tmp_path)
+        ok, frame = cap.read()
+        cap.release()
+
+        if ok and frame is not None and getattr(frame, "size", 0) > 0:
+            return frame
+        return None
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+def encode_jpg_b64(img_bgr: np.ndarray) -> str:
+    ok, buf = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
     if not ok:
-        raise RuntimeError("Failed to encode image")
+        raise ValueError("Failed to encode image.")
     return base64.b64encode(buf).decode("utf-8")
 
-def sniff_kind(data, isvideo_hint=False):
-    if data[:6] in (b"GIF87a", b"GIF89a"):
-        return "gif"
-    if data[4:8] == b"ftyp" or data[:4] == b"\x1aE\xdf\xa3" or data[:4] == b"RIFF":
-        return "video"
-    return "video" if isvideo_hint else "image"
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    denom = (np.linalg.norm(a) * np.linalg.norm(b))
+    if denom == 0:
+        return -1.0
+    return float(np.dot(a, b) / denom)
 
-def cosine(a, b):
-    a = np.asarray(a, dtype=np.float32)
-    b = np.asarray(b, dtype=np.float32)
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
+def find_matching_source(face_embedding, swaps_prepared, threshold=0.45):
+    best_src = None
+    best_sim = -1.0
+    for s in swaps_prepared:
+        sim = cosine_similarity(face_embedding, s["targetembedding"])
+        if sim > threshold and sim > best_sim:
+            best_sim = sim
+            best_src = s["sourceface"]
+    return best_src
 
-def gif_frames(data):
-    img = Image.open(io.BytesIO(data))
-    frames, durations = [], []
-    for frame in ImageSequence.Iterator(img):
-        rgb = frame.convert("RGB")
-        bgr = cv2.cvtColor(np.array(rgb), cv2.COLOR_RGB2BGR)
-        frames.append(bgr)
-        durations.append(frame.info.get("duration", 80))
-    return frames, durations
+def apply_gfpgan(img_bgr: np.ndarray):
+    if gfpgan_enhancer is None:
+        return img_bgr
+    try:
+        _, _, restored = gfpgan_enhancer.enhance(
+            img_bgr,
+            has_aligned=False,
+            only_center_face=False,
+            paste_back=True
+        )
+        return restored if restored is not None else img_bgr
+    except Exception as e:
+        print(f"Worker: GFPGAN failed: {e}")
+        return img_bgr
 
-def write_temp(data, suffix):
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    os.close(fd)
-    with open(path, "wb") as f:
-        f.write(data)
-    return path
+def apply_codeformer(img_bgr: np.ndarray, fidelity=0.7):
+    try:
+        assets = load_codeformer()
+        if assets is None:
+            return img_bgr
 
-def sample_video_frames(path, max_samples=30):
-    cap = cv2.VideoCapture(path)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    if total <= 0:
-        cap.release()
-        return []
-    idxs = np.linspace(0, total - 1, min(max_samples, total)).astype(int).tolist()
-    frames = []
-    wanted = set(idxs)
-    i = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if i in wanted:
-            frames.append(frame.copy())
-        i += 1
-    cap.release()
-    return frames
+        import torch
+        from basicsr.utils import img2tensor, tensor2img
+        from torchvision.transforms.functional import normalize
+        from facelib.utils.face_restoration_helper import FaceRestoreHelper
 
-def cluster_faces(frames):
-    detections = []
-    for frame in frames:
-        faces = app.get(frame)
-        h, w = frame.shape[:2]
-        for f in faces:
-            box = f.bbox.astype(int)
-            x1, y1 = max(0, box[0]), max(0, box[1])
-            x2, y2 = min(w, box[2]), min(h, box[3])
-            crop = frame[y1:y2, x1:x2]
-            if crop.size == 0:
-                continue
-            detections.append({
-                "embedding": np.asarray(f.embedding, dtype=np.float32),
-                "normed_embedding": np.asarray(f.normed_embedding, dtype=np.float32),
-                "thumb": crop,
-                "score": float((x2 - x1) * (y2 - y1)),
-            })
+        device = assets["device"]
+        net = assets["net"]
+        bg_upsampler = assets["bg_upsampler"]
 
-    if not detections:
-        return []
+        face_helper = FaceRestoreHelper(
+            upscale_factor=1,
+            face_size=512,
+            crop_ratio=(1, 1),
+            det_model="retinaface_resnet50",
+            save_ext="png",
+            use_parse=True,
+            device=device
+        )
 
-    clusters = []
-    for i, d in enumerate(detections):
-        vec = d["normed_embedding"]
-        matched = False
-        for c in clusters:
-            centroid = np.mean([detections[idx]["normed_embedding"] for idx in c], axis=0)
-            centroid = centroid / (np.linalg.norm(centroid) + 1e-9)
-            if float(np.dot(vec, centroid)) >= 1.0 - CLUSTER_THRESH:
-                c.append(i)
-                matched = True
-                break
-        if not matched:
-            clusters.append([i])
+        face_helper.clean_all()
+        face_helper.read_image(img_bgr)
+        face_helper.get_face_landmarks_5(only_center_face=False, resize=640, eye_dist_threshold=5)
+        face_helper.align_warp_face()
 
-    out = []
-    for label, cidx in enumerate(clusters):
-        best = max(cidx, key=lambda idx: detections[idx]["score"])
-        centroid = np.mean([detections[idx]["embedding"] for idx in cidx], axis=0)
-        thumbb64 = img_to_b64(detections[best]["thumb"], ".jpg")
-        out.append({
-            "character_id": int(label),
-            "thumbnailbase64": thumbb64,
-            "embedding": centroid.tolist(),
-        })
-    return out
+        if len(face_helper.cropped_faces) == 0:
+            return img_bgr
 
-def build_assignments(swaps):
-    active = []
-    for s in swaps:
-        newface_b64 = s.get("newface")
+        for cropped_face in face_helper.cropped_faces:
+            cropped_face_t = img2tensor(cropped_face / 255.0, bgr2rgb=True, float32=True)
+            normalize(cropped_face_t, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True)
+            cropped_face_t = cropped_face_t.unsqueeze(0).to(device)
+
+            try:
+                with torch.no_grad():
+                    output = net(cropped_face_t, w=fidelity, adain=True)[0]
+                    restored_face = tensor2img(output, rgb2bgr=True, min_max=(-1, 1))
+                restored_face = restored_face.astype("uint8")
+                face_helper.add_restored_face(restored_face)
+            except Exception as e:
+                print(f"Worker: CodeFormer face restore failed: {e}")
+                face_helper.add_restored_face(cropped_face)
+
+        face_helper.get_inverse_affine(None)
+        restored_img = face_helper.paste_faces_to_input_image(
+            upsample_img=None if bg_upsampler is None else img_bgr
+        )
+        return restored_img if restored_img is not None else img_bgr
+
+    except Exception as e:
+        print(f"Worker: CodeFormer failed: {e}")
+        return img_bgr
+
+def apply_enhancer(img_bgr: np.ndarray, pipeline: str) -> np.ndarray:
+    pipeline = (pipeline or "fast").lower()
+    if "gfpgan" in pipeline:
+        return apply_gfpgan(img_bgr)
+    if "codeformer" in pipeline:
+        return apply_codeformer(img_bgr)
+    return img_bgr
+
+def prepare_swaps(swaps_input):
+    swaps_prepared = []
+    for s in swaps_input:
+        new_face_raw = s.get("newface") or s.get("sourceimage")
         target_embedding = s.get("targetembedding")
-        if not newface_b64 or target_embedding is None:
+
+        if not new_face_raw or target_embedding is None:
             continue
-        srcimg = bytes_to_img(b64_to_bytes(newface_b64))
-        if srcimg is None:
-            continue
-        srcfaces = app.get(srcimg)
-        if not srcfaces:
-            continue
-        largest = max(
-            srcfaces,
-            key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])
-        )
-        active.append({
-            "targetemb": np.asarray(target_embedding, dtype=np.float32),
-            "sourceface": largest,
-        })
-    return active
 
-def maybe_enhance(frame, enable):
-    if not enable:
-        return frame
-    enhancer = get_gfpgan()
-    if not enhancer:
-        return frame
-    _, _, out = enhancer.enhance(frame, has_aligned=False, only_center_face=False, paste_back=True)
-    return out
-
-def process_frame(img, assignments, enhance=False):
-    faces = app.get(img)
-    for tface in faces:
-        best = None
-        best_score = -1.0
-        for s in assignments:
-            sim = cosine(tface.embedding, s["targetemb"])
-            if sim > best_score:
-                best_score = sim
-                best = s
-        if best is not None and best_score >= MATCH_THRESH:
-            img = swapper.get(img, tface, best["sourceface"], paste_back=True)
-    return maybe_enhance(img, enhance)
-
-def handle_detect(mediab64, isvideo):
-    data = b64_to_bytes(mediab64)
-    kind = sniff_kind(data, isvideo)
-
-    if kind == "image":
-        img = bytes_to_img(data)
-        if img is None:
-            return {"error": "Could not decode image"}
-        frames = [img]
-    elif kind == "gif":
-        frames, _ = gif_frames(data)
-    else:
-        path = write_temp(data, ".mp4")
         try:
-            frames = sample_video_frames(path, DETECT_SAMPLES)
-        finally:
-            if os.path.exists(path):
-                os.remove(path)
+            src_bytes = resolve_media_to_bytes(new_face_raw)
+            src_img = decode_image_bytes(src_bytes)
+            if src_img is None:
+                continue
 
-    if not frames:
-        return {"characters": []}
+            src_faces = faceapp.get(src_img)
+            if not src_faces:
+                continue
 
-    return {"characters": cluster_faces(frames)}
+            swaps_prepared.append({
+                "targetembedding": np.array(target_embedding, dtype=np.float32),
+                "sourceface": src_faces[0]
+            })
+        except Exception as e:
+            print(f"Worker: failed preparing swap source: {e}")
 
-def handle_swap(mediab64, isvideo, swaps, pipeline):
-    assignments = build_assignments(swaps or [])
-    if not assignments:
-        return {"error": "No usable face found in the replacement photos"}
+    return swaps_prepared
 
-    enhance = str(pipeline).lower() not in ("", "none", "fast", "1")
+def detect_characters(frame):
+    faces = faceapp.get(frame)
+    characters = []
 
-    data = b64_to_bytes(mediab64)
-    kind = sniff_kind(data, isvideo)
+    h, w = frame.shape[:2]
+    for idx, face in enumerate(faces):
+        bbox = [int(v) for v in face.bbox.tolist()]
+        x1, y1 = max(0, bbox[0]), max(0, bbox[1])
+        x2, y2 = min(w, bbox[2]), min(h, bbox[3])
+        crop = frame[y1:y2, x1:x2]
 
-    if kind == "image":
-        img = bytes_to_img(data)
-        if img is None:
-            return {"error": "Could not decode image"}
-        out = process_frame(img, assignments, enhance)
-        return {"mediatype": "image", "base64": img_to_b64(out)}
+        thumb_b64 = ""
+        if crop is not None and crop.size > 0:
+            thumb_b64 = encode_jpg_b64(crop)
 
-    if kind == "gif":
-        frames, durations = gif_frames(data)
-        out_frames = []
-        for fr in frames:
-            fr = process_frame(fr, assignments, enhance)
-            out_frames.append(Image.fromarray(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)))
-        buf = io.BytesIO()
-        out_frames[0].save(
-            buf,
-            format="GIF",
-            save_all=True,
-            append_images=out_frames[1:],
-            duration=durations,
-            loop=0,
-            disposal=2,
-        )
-        return {"mediatype": "gif", "base64": base64.b64encode(buf.getvalue()).decode("utf-8")}
+        emb = getattr(face, "normed_embedding", None)
+        if emb is None:
+            emb = getattr(face, "embedding", None)
+            if emb is not None:
+                norm = np.linalg.norm(emb)
+                emb = emb / norm if norm > 0 else emb
 
-    inpath = write_temp(data, ".mp4")
-    rawpath = inpath + ".raw.mp4"
-    finalpath = inpath + ".final.mp4"
+        if emb is None:
+            continue
+
+        characters.append({
+            "index": idx,
+            "thumbnailbase64": thumb_b64,
+            "embedding": emb.tolist()
+        })
+
+    return characters
+
+def swap_on_image(img, swaps_prepared, pipeline):
+    if swapper is None:
+        return {"error": "Inswapper model is not initialized or not found on worker."}
+
+    faces = faceapp.get(img)
+    out = img.copy()
+
+    for face in faces:
+        emb = getattr(face, "normed_embedding", None)
+        if emb is None:
+            emb = getattr(face, "embedding", None)
+            if emb is not None:
+                norm = np.linalg.norm(emb)
+                emb = emb / norm if norm > 0 else emb
+        if emb is None:
+            continue
+
+        matched_source = find_matching_source(emb, swaps_prepared)
+        if matched_source is not None:
+            out = swapper.get(out, face, matched_source, paste_back=True)
+
+    out = apply_enhancer(out, pipeline)
+    return {
+        "status": "success",
+        "mediatype": "image",
+        "base64": encode_jpg_b64(out)
+    }
+
+def swap_on_video(media_bytes, swaps_prepared, pipeline):
+    if swapper is None:
+        return {"error": "Inswapper model is not initialized or not found on worker."}
+
+    in_path = None
+    out_path = None
 
     try:
-        cap = cv2.VideoCapture(inpath)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        writer = cv2.VideoWriter(rawpath, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            tmp.write(media_bytes)
+            in_path = tmp.name
 
-        while True:
-            ok, fr = cap.read()
-            if not ok:
+        out_path = in_path.replace(".mp4", "_out.mp4")
+
+        cap = cv2.VideoCapture(in_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        if width <= 0 or height <= 0:
+            cap.release()
+            return {"error": "Invalid video dimensions."}
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
                 break
-            writer.write(process_frame(fr, assignments, enhance))
+
+            faces = faceapp.get(frame)
+            swapped = frame.copy()
+
+            for face in faces:
+                emb = getattr(face, "normed_embedding", None)
+                if emb is None:
+                    emb = getattr(face, "embedding", None)
+                    if emb is not None:
+                        norm = np.linalg.norm(emb)
+                        emb = emb / norm if norm > 0 else emb
+                if emb is None:
+                    continue
+
+                matched_source = find_matching_source(emb, swaps_prepared)
+                if matched_source is not None:
+                    swapped = swapper.get(swapped, face, matched_source, paste_back=True)
+
+            swapped = apply_enhancer(swapped, pipeline)
+            writer.write(swapped)
 
         cap.release()
         writer.release()
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", rawpath,
-            "-i", inpath,
-            "-map", "0:v:0",
-            "-map", "1:a:0?",
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-crf", "18",
-            "-c:a", "aac",
-            "-shortest",
-            "-movflags", "faststart",
-            finalpath
-        ]
-        r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        target = finalpath if r.returncode == 0 and os.path.exists(finalpath) else rawpath
+        with open(out_path, "rb") as f:
+            video_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-        with open(target, "rb") as f:
-            outb64 = base64.b64encode(f.read()).decode("utf-8")
-        return {"mediatype": "video", "base64": outb64}
-    finally:
-        for p in (inpath, rawpath, finalpath):
-            if p and os.path.exists(p):
-                os.remove(p)
-
-def handler(job):
-    job_input = job.get("input", {}) or {}
-    action = job_input.get("action")
-    mediab64 = job_input.get("media") or job_input.get("targetimage") or job_input.get("target")
-    isvideo = bool(job_input.get("isvideo", False))
-
-    if not mediab64:
         return {
-            "error": "Missing media payload for detection.",
-            "keysreceived": list(job_input.keys())
+            "status": "success",
+            "mediatype": "video",
+            "base64": video_b64
         }
 
-    try:
-        if action == "detect":
-            return handle_detect(mediab64, isvideo)
-        if action == "swap":
-            return handle_swap(
-                mediab64,
-                isvideo,
-                job_input.get("swaps", []),
-                job_input.get("pipeline", "fast"),
-            )
-        return {"error": f"Invalid action: {action}"}
     except Exception as e:
-        traceback.print_exc()
-        return {"error": f"{type(e).__name__}: {e}"}
+        return {"error": f"Video swap failed: {str(e)}"}
+    finally:
+        for p in [in_path, out_path]:
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+def handler(event):
+    try:
+        jobinput = event.get("input", {}) or {}
+        action = (jobinput.get("action") or "swap").lower()
+
+        media_raw = jobinput.get("media") or jobinput.get("targetimage") or jobinput.get("image")
+        if not media_raw:
+            return {"error": "Missing media payload in request."}
+
+        is_video = bool(jobinput.get("isvideo", False))
+        pipeline = str(jobinput.get("pipeline", "fast"))
+
+        try:
+            media_bytes = resolve_media_to_bytes(media_raw)
+        except Exception as e:
+            return {"error": f"Failed reading media: {str(e)}"}
+
+        if not media_bytes:
+            return {"error": "Media buffer is empty."}
+
+        if action == "detect":
+            frame = extract_first_frame(media_bytes, is_video)
+            if frame is None:
+                return {"error": "Could not decode media to scan for faces."}
+
+            characters = detect_characters(frame)
+            return {
+                "status": "success",
+                "characters": characters
+            }
+
+        if action == "swap":
+            swaps_input = jobinput.get("swaps", [])
+            if not swaps_input:
+                return {"error": "Missing swaps list."}
+
+            swaps_prepared = prepare_swaps(swaps_input)
+            if not swaps_prepared:
+                return {"error": "Could not detect a valid face in any uploaded new face image."}
+
+            if not is_video:
+                img = decode_image_bytes(media_bytes)
+                if img is None:
+                    return {"error": "Failed decoding target image."}
+                return swap_on_image(img, swaps_prepared, pipeline)
+
+            return swap_on_video(media_bytes, swaps_prepared, pipeline)
+
+        return {"error": f"Unknown action: {action}"}
+
+    except Exception as e:
+        return {"error": f"Unhandled worker error: {str(e)}"}
 
 if __name__ == "__main__":
     runpod.serverless.start({"handler": handler})
