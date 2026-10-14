@@ -1,69 +1,51 @@
-# syntax=docker/dockerfile:1
+FROM pytorch/pytorch:2.1.2-cuda11.8-cudnn8-runtime
 
-FROM python:3.11-slim-bookworm
-
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    FACEFUSION_PATH=/opt/facefusion \
-    WORK_ROOT=/tmp/faceswap-jobs \
-    FF_EXECUTION_PROVIDER=cuda \
-    LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+ENV LD_LIBRARY_PATH=/opt/conda/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+ENV INSWAPPER_PATH=/app/models/inswapper128.onnx
+ENV GFPGAN_PATH=/app/models/GFPGANv1.4.pth
 
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg git curl ca-certificates \
-    libglib2.0-0 libgl1 libsm6 libxext6 libxrender1 \
+    git \
+    wget \
+    curl \
+    unzip \
+    ffmpeg \
+    libgl1 \
+    libglib2.0-0 \
     build-essential \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python --version && python -c "from typing import NotRequired; print('NotRequired OK')"
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    python -m pip uninstall -y onnxruntime onnxruntime-gpu || true && \
+    python -m pip install \
+      "numpy>=1.23.5,<2.0.0" \
+      opencv-python-headless==4.9.0.80 \
+      onnxruntime-gpu==1.16.3 \
+      insightface==0.7.3 \
+      pillow \
+      requests \
+      tqdm \
+      runpod \
+      gfpgan==1.3.8 \
+      basicsr==1.4.2 \
+      facexlib==0.3.0
 
-RUN python -m pip install --upgrade pip setuptools wheel
-RUN python -m pip install numpy requests runpod opencv-python-headless
-RUN python -m pip install insightface==0.7.3
-RUN python -m pip uninstall -y onnxruntime onnxruntime-gpu || true
-RUN python -m pip install onnxruntime-gpu==1.26.0
+RUN python -m pip install "numpy==1.26.4"
 
-RUN git clone --depth 1 https://github.com/facefusion/facefusion.git ${FACEFUSION_PATH}
-
-RUN python - <<'PY'
-from pathlib import Path
-import re
-
-p = Path("/opt/facefusion/facefusion/execution.py")
-text = p.read_text()
-
-pattern = r"def create_value_and_unit\\(text\\s*:\\s*str\\)\\s*->\\s*Optional\\[ValueAndUnit\\]:\\n(?:\\t|    ).*?(?=\\ndef |\\nclass |\\Z)"
-
-replacement = '''def create_value_and_unit(text : str) -> Optional[ValueAndUnit]:
-\tif not text:
-\t\treturn None
-\ttext = str(text).strip()
-\tif not text or text.lower().startswith('insufficient') or text.upper() == 'N/A':
-\t\treturn None
-\tparts = text.split()
-\tif len(parts) >= 2:
-\t\tvalue, unit = parts[0], parts[1]
-\t\ttry:
-\t\t\treturn\
-\t\t\t{
-\t\t\t\t'value': int(float(value)),
-\t\t\t\t'unit': str(unit)
-\t\t\t}
-\t\texcept Exception:
-\t\t\treturn None
-\treturn None
-'''
-
-new_text, count = re.subn(pattern, replacement, text, flags=re.S)
-if count != 1:
-    raise SystemExit(f"Expected to patch 1 function, patched {count}")
-
-p.write_text(new_text)
-print("Patched FaceFusion execution.py")
-PY
+RUN mkdir -p /root/.insightface/models /app/models && \
+    wget -O /tmp/buffalo_l.zip https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip && \
+    unzip -oq /tmp/buffalo_l.zip -d /root/.insightface/models/ && \
+    rm -f /tmp/buffalo_l.zip && \
+    wget -O /app/models/inswapper128.onnx https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx && \
+    wget -O /app/models/GFPGANv1.4.pth https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth && \
+    test -s /app/models/inswapper128.onnx && \
+    test -s /app/models/GFPGANv1.4.pth
 
 COPY handler.py /app/handler.py
 
