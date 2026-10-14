@@ -15,7 +15,7 @@ WORKDIR /app/facefusion
 
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt || true && \
-    pip install "numpy<2.0.0" --force-reinstall
+    pip install "numpy<2.0.0" runpod --force-reinstall
 
 COPY handler.py /app/handler.py
 
