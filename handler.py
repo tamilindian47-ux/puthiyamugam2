@@ -19,20 +19,24 @@ def find_model_path():
     candidates = [
         os.environ.get("SWAPPERPATH"),
         os.environ.get("INSWAPPERPATH"),
-        "/models/inswapper_128.onnx",
+        "/app/models/inswapper128.onnx",
+        "/app/models/inswapper_128.onnx",
         "/models/inswapper128.onnx",
-        os.path.expanduser("~/.insightface/models/inswapper_128.onnx"),
+        "/models/inswapper_128.onnx",
         os.path.expanduser("~/.insightface/models/inswapper128.onnx"),
-        "./inswapper_128.onnx",
+        os.path.expanduser("~/.insightface/models/inswapper_128.onnx"),
         "./inswapper128.onnx",
+        "./inswapper_128.onnx",
     ]
     for p in candidates:
         if p and os.path.exists(p):
-            return p
+            return os.path.abspath(p)
     return None
 
 SWAPPER_PATH = find_model_path()
 swapper = None
+
+print(f"Worker: Resolved SWAPPER_PATH to -> {SWAPPER_PATH}")
 
 if SWAPPER_PATH:
     try:
@@ -41,11 +45,11 @@ if SWAPPER_PATH:
             download=False,
             providers=PROVIDERS
         )
-        print(f"Worker: inswapper loaded from {SWAPPER_PATH}")
+        print(f"Worker: inswapper successfully loaded from {SWAPPER_PATH}")
     except Exception as e:
-        print(f"Worker: failed to load inswapper: {e}")
+        print(f"Worker: failed to load inswapper from path: {e}")
 else:
-    print("Worker: inswapper model not found in expected locations.")
+    print("Worker ERROR: inswapper model file could not be found in any candidate directory!")
 
 gfpgan_enhancer = None
 try:
