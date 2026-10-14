@@ -13,9 +13,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN git clone https://github.com/facefusion/facefusion.git /app/facefusion
 WORKDIR /app/facefusion
 
+COPY requirements.txt /app/requirements.txt
 RUN pip install --upgrade pip && \
-    pip install -r requirements.txt || true && \
-    pip install "numpy<2.0.0" runpod --force-reinstall
+    pip install -r /app/requirements.txt
 
 COPY handler.py /app/handler.py
 
