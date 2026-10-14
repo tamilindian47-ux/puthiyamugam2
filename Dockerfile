@@ -22,7 +22,7 @@ RUN python -m pip install --upgrade pip setuptools wheel
 RUN python -m pip install numpy requests runpod opencv-python-headless
 RUN python -m pip install insightface==0.7.3
 RUN python -m pip uninstall -y onnxruntime onnxruntime-gpu || true
-RUN python -m pip install onnxruntime-gpu
+RUN python -m pip install onnxruntime-gpu==1.26.0
 
 RUN git clone --depth 1 https://github.com/facefusion/facefusion.git ${FACEFUSION_PATH}
 
