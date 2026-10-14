@@ -6,3 +6,4 @@ opencv-python-headless
 pillow
 requests
 tqdm
+typing-extensions>=4.5.0
