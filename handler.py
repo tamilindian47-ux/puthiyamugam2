@@ -8,7 +8,6 @@ import numpy as np
 
 print("Worker: Initializing FaceFusion Serverless Handler...")
 
-# Lazy-load faceapp to prevent startup crashes if model paths or downloads take a moment
 _faceapp = None
 def get_faceapp():
     global _faceapp
@@ -130,10 +129,11 @@ def handler(event):
             with open(source_path, "wb") as f:
                 f.write(source_bytes)
 
-            swapper_model = jobinput.get("model", "hyperswap_1c")
+            # Map user parameters (defaulting to HyperSwap 1A for extreme angles/motion)
+            swapper_model = jobinput.get("model", "hyperswap_1a_256")
             enhancer = jobinput.get("enhancer", "codeformer")
             enhancer_blend = str(jobinput.get("enhancer_blend", 35))
-            expression_factor = str(jobinput.get("expression_factor", 80))
+            expression_factor = str(jobinput.get("expression_factor", 85))
 
             processors = ["face_swapper", "expression_restorer"]
             if enhancer != "none":
