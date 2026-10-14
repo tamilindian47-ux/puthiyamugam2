@@ -6,14 +6,12 @@ ENV PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# System deps + Python
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-dev \
     ffmpeg libgl1 libglib2.0-0 \
     wget curl unzip ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Python deps
 RUN python3 -m pip install --upgrade pip && \
     python3 -m pip install \
       "numpy==1.26.4" \
@@ -24,7 +22,6 @@ RUN python3 -m pip install --upgrade pip && \
       opencv-python-headless \
       pillow requests tqdm runpod
 
-# Pre-download checkpoints into the image (reduces cold start)
 RUN mkdir -p /app/checkpoints && \
     wget --progress=dot:giga --tries=5 --timeout=60 \
       -O /app/checkpoints/inswapper_128.onnx \
@@ -40,7 +37,6 @@ RUN wget --tries=5 --timeout=60 -O /app/checkpoints/enhancer.onnx \
       "https://huggingface.co/facefusion/models-3.0.0/resolve/main/gpen_bfr_512.onnx" ; \
     test -s /app/checkpoints/enhancer.onnx
 
-# InsightFace buffalo_l model
 RUN mkdir -p /root/.insightface/models/buffalo_l && \
     curl -fL --retry 5 --retry-delay 5 -o /tmp/buffalo_l.zip \
       "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip" && \
