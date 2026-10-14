@@ -1,49 +1,53 @@
-FROM pytorch/pytorch:2.1.2-cuda11.8-cudnn8-runtime
+FROM runpod/base:0.4.0-cuda11.8.0
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
+ENV OMP_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
+ENV OPENBLAS_NUM_THREADS=1
 
 WORKDIR /app
 
-# System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git wget curl unzip ffmpeg libgl1 libglib2.0-0 build-essential ca-certificates \
+    python3 \
+    python3-pip \
+    python3-dev \
+    build-essential \
+    ffmpeg \
+    libgl1 \
+    libglib2.0-0 \
+    wget \
+    curl \
+    unzip \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone FaceFusion if needed for other scripts
-RUN git clone https://github.com/facefusion/facefusion.git /app/facefusion
+RUN python3 -m pip install --upgrade pip setuptools wheel && \
+    python3 -m pip install \
+    "numpy==1.26.4" \
+    "onnxruntime-gpu==1.17.1" \
+    "insightface==0.7.3" \
+    "opencv-python-headless==4.9.0.80" \
+    "pillow>=10.0.0" \
+    "imageio>=2.31.0" \
+    "imageio-ffmpeg>=0.4.9" \
+    requests \
+    tqdm \
+    runpod
 
-# Install python dependencies
-COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip && \
-    pip install -r /app/requirements.txt
+RUN mkdir -p /app/checkpoints && \
+    wget --progress=dot:giga --tries=5 --timeout=60 \
+      -O /app/checkpoints/inswapper_128.onnx \
+      https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx
 
-# Create model destination directories
-RUN mkdir -p /app/checkpoints /root/.insightface/models/buffalo_l
-
-# 1. Download Inswapper 128
-RUN wget --progress=dot:giga --tries=5 --timeout=60 \
-    https://github.com/deepinsight/insightface/releases/download/v0.7/inswapper_128.onnx \
-    -O /app/checkpoints/inswapper_128.onnx
-
-# 2. Download Face Occluder (using verified models-3.0.0 tag)
-RUN wget --progress=dot:giga --tries=5 --timeout=60 \
-    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/face_occluder.onnx \
-    -O /app/checkpoints/face_occluder.onnx
-
-# 3. Download CodeFormer Enhancer (using verified models-3.0.0 tag)
-RUN wget --progress=dot:giga --tries=5 --timeout=60 \
-    https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/codeformer.onnx \
-    -O /app/checkpoints/enhancer.onnx
-
-# 4. Bake Buffalo_L so insightface never calls out to GitHub at startup
-RUN wget --progress=dot:giga --tries=5 --timeout=60 \
-    https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip \
-    -O /tmp/buffalo_l.zip && \
-    unzip -q -o /tmp/buffalo_l.zip -d /root/.insightface/models/buffalo_l && \
+RUN mkdir -p /root/.insightface/models && \
+    curl -fL --retry 5 --retry-delay 5 \
+      -o /tmp/buffalo_l.zip \
+      https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip && \
+    unzip -q -o /tmp/buffalo_l.zip -d /root/.insightface/models && \
     rm -f /tmp/buffalo_l.zip
 
 COPY handler.py /app/handler.py
 
-CMD ["python", "-u", "/app/handler.py"]
+CMD ["python3", "-u", "/app/handler.py"]
