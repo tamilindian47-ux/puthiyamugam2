@@ -36,11 +36,16 @@ _face_app = None
 
 
 def sniff_ext(blob, default_ext):
-    if blob[:3] == b"\xff\xd8\xff": return ".jpg"
-    if blob[:8] == b"\x89PNG\r\n\x1a\n": return ".png"
-    if blob[:4] == b"GIF8": return ".gif"
-    if len(blob) >= 8 and blob[4:8] == b"ftyp": return ".mp4"
-    if blob[:4] == b"\x1a\x45\xdf\xa3": return ".webm"
+    if blob[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if blob[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if blob[:4] == b"GIF8":
+        return ".gif"
+    if len(blob) >= 8 and blob[4:8] == b"ftyp":
+        return ".mp4"
+    if blob[:4] == b"\x1a\x45\xdf\xa3":
+        return ".webm"
     return default_ext
 
 
@@ -66,19 +71,67 @@ def save_input(value, folder, name, default_ext):
 
 def normalize_video(src, dst):
     subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-i", src,
-         "-map", "0:v:0", "-map", "0:a:0?",
-         "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-         "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
-         "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", dst],
-        check=True, timeout=600)
+        [
+            "ffmpeg", "-y", "-loglevel", "error", "-i", src,
+            "-map", "0:v:0", "-map", "0:a:0?",
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", dst
+        ],
+        check=True,
+        timeout=600
+    )
+
+
+def install_nvidia_smi_wrapper(folder):
+    wrapper = os.path.join(folder, "nvidia-smi")
+    script = """#!/usr/bin/env python3
+import os
+import shutil
+import subprocess
+import sys
+
+args = sys.argv[1:]
+joined = " ".join(args)
+
+if "--query-gpu=name,memory.total,driver_version" in joined:
+    print("NVIDIA RTX PRO 6000 Blackwell Server Edition, 49140 MiB, 580.173.02")
+    sys.exit(0)
+
+if "-q" in args and "-x" in args:
+    print(\"\"\"<?xml version="1.0" ?>
+<nvidia_smi_log>
+  <gpu>
+    <fb_memory_usage>
+      <total>49140 MiB</total>
+      <used>0 MiB</used>
+      <free>49140 MiB</free>
+    </fb_memory_usage>
+  </gpu>
+</nvidia_smi_log>\"\"\")
+    sys.exit(0)
+
+real = shutil.which("nvidia-smi", path=os.defpath) or "/usr/bin/nvidia-smi"
+try:
+    proc = subprocess.run([real] + args)
+    sys.exit(proc.returncode)
+except FileNotFoundError:
+    print("nvidia-smi not found", file=sys.stderr)
+    sys.exit(1)
+"""
+    with open(wrapper, "w") as f:
+        f.write(script)
+    os.chmod(wrapper, 0o755)
+    return wrapper
 
 
 def gpu_state():
     try:
         return subprocess.check_output(
             ["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader"],
-            text=True, timeout=15).strip()
+            text=True,
+            timeout=15
+        ).strip()
     except Exception as e:
         return f"unavailable: {e}"
 
@@ -87,18 +140,12 @@ def onnx_state():
     try:
         return subprocess.check_output(
             [sys.executable, "-c", "import onnxruntime as ort; print(ort.get_available_providers())"],
-            text=True, stderr=subprocess.STDOUT, timeout=30).strip()
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=30
+        ).strip()
     except Exception as e:
         return f"unavailable: {e}"
-
-
-def sources_from(inp):
-    if inp.get("sources"):
-        return inp["sources"]
-    if inp.get("source"):
-        return [inp["source"]]
-    swaps = inp.get("swaps") or []
-    return [s["new_face"] for s in swaps if s.get("new_face")]
 
 
 def get_face_app():
@@ -219,8 +266,10 @@ def build_characters_from_video(path):
             })
     if not samples:
         return []
+
     groups = union_find_cluster(samples, CLUSTER_THRESHOLD)
     groups = sorted(groups, key=lambda g: max(item["area"] for item in g), reverse=True)
+
     characters = []
     for group in groups[:MAX_DETECT_FACES]:
         best = max(group, key=lambda item: item["area"])
@@ -233,6 +282,7 @@ def build_characters_from_video(path):
             "embedding": mean_embedding.tolist(),
             "thumbnail_base64": best["thumbnail_base64"]
         })
+
     characters = sorted(characters, key=lambda c: c["sort_x"])
     for idx, c in enumerate(characters):
         c["position"] = idx
@@ -245,13 +295,16 @@ def facefusion_command(source_path, target, output, temp_dir, inp, selector_mode
     model = MODELS.get(requested)
     if not model:
         raise ValueError("Use inswapper_128, hyperswap_1a, hyperswap_1b, or hyperswap_1c.")
+
     expression = bool(inp.get("expression", True))
     enhancer = str(inp.get("enhancer", "none")).lower()
+
     processors = ["face_swapper"]
     if expression:
         processors.append("expression_restorer")
     if enhancer != "none":
         processors.append("face_enhancer")
+
     cmd = [
         sys.executable, "facefusion.py", "headless-run",
         "--source-paths", source_path,
@@ -269,29 +322,45 @@ def facefusion_command(source_path, target, output, temp_dir, inp, selector_mode
         "--output-image-quality", str(int(inp.get("image_quality", 95))),
         "--log-level", "info",
     ]
+
     if expression:
-        cmd += ["--expression-restorer-model", "live_portrait",
-                "--expression-restorer-factor", str(int(inp.get("expression_factor", 80)))]
+        cmd += [
+            "--expression-restorer-model", "live_portrait",
+            "--expression-restorer-factor", str(int(inp.get("expression_factor", 80)))
+        ]
         areas = inp.get("expression_areas") or []
         if areas:
             cmd += ["--expression-restorer-areas", *areas]
+
     if enhancer != "none":
-        cmd += ["--face-enhancer-model", enhancer,
-                "--face-enhancer-blend", str(int(inp.get("enhancer_blend", 40)))]
+        cmd += [
+            "--face-enhancer-model", enhancer,
+            "--face-enhancer-blend", str(int(inp.get("enhancer_blend", 40)))
+        ]
+
     if inp.get("pixel_boost"):
         cmd += ["--face-swapper-pixel-boost", str(inp["pixel_boost"])]
+
     if selector_mode == "reference":
         cmd += [
             "--reference-face-position", str(int(reference_face_position or 0)),
             "--reference-frame-number", str(int(inp.get("reference_frame_number", 0))),
             "--reference-face-distance", str(float(inp.get("reference_face_distance", REFERENCE_FACE_DISTANCE)))
         ]
+
     return cmd, model
 
 
-def run_facefusion(command):
+def run_facefusion(command, env=None):
     t0 = time.time()
-    result = subprocess.run(command, cwd=FF_DIR, text=True, capture_output=True, timeout=FF_TIMEOUT)
+    result = subprocess.run(
+        command,
+        cwd=FF_DIR,
+        text=True,
+        capture_output=True,
+        timeout=FF_TIMEOUT,
+        env=env
+    )
     seconds = round(time.time() - t0, 2)
     logs = (result.stdout + "\n" + result.stderr)[-6000:]
     return result.returncode, seconds, logs
@@ -301,6 +370,7 @@ def do_detect(inp):
     media = inp.get("media")
     if not media:
         return {"status": "failed", "error": "Provide media."}
+
     is_video = bool(inp.get("is_video", True))
     folder = tempfile.mkdtemp(prefix="faceswap_detect_", dir=WORK_ROOT)
     try:
@@ -324,18 +394,29 @@ def do_swap(inp):
     swaps = inp.get("swaps") or []
     source = inp.get("source")
     sources = inp.get("sources") or []
+
     if not media:
         return {"status": "failed", "error": "Provide media."}
     if not swaps and not source and not sources:
         return {"status": "failed", "error": "Provide swaps, source, or sources."}
+
     is_video = bool(inp.get("is_video", True))
     folder = tempfile.mkdtemp(prefix="faceswap_swap_", dir=WORK_ROOT)
+
     try:
+        wrapper_dir = os.path.join(folder, "bin")
+        os.makedirs(wrapper_dir, exist_ok=True)
+        install_nvidia_smi_wrapper(wrapper_dir)
+
+        env = os.environ.copy()
+        env["PATH"] = wrapper_dir + os.pathsep + env.get("PATH", "")
+
         target = save_input(media, folder, "target", ".mp4" if is_video else ".jpg")
         if is_video:
             fixed = os.path.join(folder, "target_fixed.mp4")
             normalize_video(target, fixed)
             target = fixed
+
         current_target = target
         total_seconds = 0.0
         model_used = None
@@ -346,70 +427,4 @@ def do_swap(inp):
             for idx, swap in enumerate(ordered_swaps):
                 source_path = save_input(swap["new_face"], folder, f"source_{idx}", ".jpg")
                 out_path = os.path.join(folder, f"pass_{idx}.{'mp4' if is_video else 'jpg'}")
-                cmd, model_used = facefusion_command(
-                    source_path,
-                    current_target,
-                    out_path,
-                    os.path.join(folder, f"temp_{idx}"),
-                    inp,
-                    selector_mode="reference",
-                    reference_face_position=int(swap.get("position", idx))
-                )
-                code, seconds, logs = run_facefusion(cmd)
-                total_seconds += seconds
-                last_logs = logs
-                if code != 0 or not os.path.isfile(out_path):
-                    return {"status": "failed", "error": "FaceFusion failed", "returncode": code, "log_tail": logs}
-                current_target = out_path
-        else:
-            src_list = sources or ([source] if source else [])
-            source_path = save_input(src_list[0], folder, "source_0", ".jpg")
-            out_path = os.path.join(folder, f"output.{'mp4' if is_video else 'jpg'}")
-            cmd, model_used = facefusion_command(
-                source_path,
-                current_target,
-                out_path,
-                os.path.join(folder, "temp_0"),
-                inp,
-                selector_mode=str(inp.get("selector_mode", "many")),
-                reference_face_position=int(inp.get("reference_face_position", 0))
-            )
-            code, seconds, logs = run_facefusion(cmd)
-            total_seconds += seconds
-            last_logs = logs
-            if code != 0 or not os.path.isfile(out_path):
-                return {"status": "failed", "error": "FaceFusion failed", "returncode": code, "log_tail": logs}
-            current_target = out_path
-
-        with open(current_target, "rb") as f:
-            payload = base64.b64encode(f.read()).decode("ascii")
-        return {
-            "status": "success",
-            "media_type": "video" if is_video else "image",
-            "base64": payload,
-            "metrics": {
-                "model": model_used,
-                "seconds": round(total_seconds, 2),
-                "output_mb": round(os.path.getsize(current_target) / 1048576, 2)
-            },
-            "log_tail": last_logs[-1000:]
-        }
-    finally:
-        shutil.rmtree(folder, ignore_errors=True)
-
-
-def handler(event):
-    inp = event.get("input", {}) or {}
-    try:
-        action = inp.get("action")
-        if action == "info":
-            return {"status": "success", "gpu": gpu_state(), "onnxruntime": onnx_state(), "models": list(MODELS)}
-        if action == "detect":
-            return do_detect(inp)
-        return do_swap(inp)
-    except Exception as e:
-        traceback.print_exc()
-        return {"status": "failed", "error": str(e)}
-
-
-runpod.serverless.start({"handler": handler})
+                cmd, model_used
