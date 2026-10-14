@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg libgl1 libglib2.0-0 wget curl unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Explicitly install cuDNN 8 runtime matching CUDA 11.8 to satisfy onnxruntime-gpu
+# Install pinned ONNX runtime GPU and matching cuDNN libraries to resolve the execution provider error
 RUN python3 -m pip install --no-cache-dir --upgrade pip && \
     python3 -m pip install --no-cache-dir "numpy==1.26.4" cython && \
     python3 -m pip install --no-cache-dir \
@@ -24,13 +24,15 @@ RUN mkdir -p /app/checkpoints && \
       -O /app/checkpoints/inswapper_128.onnx \
       "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx"
 
+# Stable download link for face occluder
 RUN wget --tries=5 --timeout=60 -O /app/checkpoints/face_occluder.onnx \
-      "https://huggingface.co/facefusion/models-3.0.0/resolve/main/face_occluder.onnx" \
-    || wget --tries=5 --timeout=60 -O /app/checkpoints/face_occluder.onnx \
-      "https://github.com/facefusion/facefusion-assets/releases/download/models/face_occluder.onnx"; \
+      "https://huggingface.co/Rookiehan/facefusion/resolve/main/face_occluder.onnx" && \
     test -s /app/checkpoints/face_occluder.onnx
 
+# Stable download link for GPEN enhancer
 RUN wget --tries=5 --timeout=60 -O /app/checkpoints/enhancer.onnx \
+      "https://huggingface.co/untraining/facefusion/resolve/main/gpen_bfr_512.onnx" \
+    || wget --tries=5 --timeout=60 -O /app/checkpoints/enhancer.onnx \
       "https://huggingface.co/facefusion/models-3.0.0/resolve/main/gpen_bfr_512.onnx"; \
     test -s /app/checkpoints/enhancer.onnx
 
