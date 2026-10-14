@@ -87,48 +87,6 @@ def normalize_video(src, dst):
     )
 
 
-def install_nvidia_smi_wrapper(folder):
-    wrapper = os.path.join(folder, "nvidia-smi")
-    script = """#!/usr/bin/env python3
-import os
-import shutil
-import subprocess
-import sys
-
-args = sys.argv[1:]
-joined = " ".join(args)
-
-if "--query-gpu=name,memory.total,driver_version" in joined:
-    print("NVIDIA RTX PRO 6000 Blackwell Server Edition, 49140 MiB, 580.173.02")
-    sys.exit(0)
-
-if "-q" in args and "-x" in args:
-    print(\"\"\"<?xml version="1.0" ?>
-<nvidia_smi_log>
-  <gpu>
-    <fb_memory_usage>
-      <total>49140 MiB</total>
-      <used>0 MiB</used>
-      <free>49140 MiB</free>
-    </fb_memory_usage>
-  </gpu>
-</nvidia_smi_log>\"\"\")
-    sys.exit(0)
-
-real = shutil.which("nvidia-smi", path=os.defpath) or "/usr/bin/nvidia-smi"
-try:
-    proc = subprocess.run([real] + args)
-    sys.exit(proc.returncode)
-except FileNotFoundError:
-    print("nvidia-smi not found", file=sys.stderr)
-    sys.exit(1)
-"""
-    with open(wrapper, "w") as f:
-        f.write(script)
-    os.chmod(wrapper, 0o755)
-    return wrapper
-
-
 def gpu_state():
     try:
         return subprocess.check_output(
@@ -355,15 +313,14 @@ def facefusion_command(source_path, target, output, temp_dir, inp, selector_mode
     return cmd, model
 
 
-def run_facefusion(command, env=None):
+def run_facefusion(command):
     t0 = time.time()
     result = subprocess.run(
         command,
         cwd=FF_DIR,
         text=True,
         capture_output=True,
-        timeout=FF_TIMEOUT,
-        env=env
+        timeout=FF_TIMEOUT
     )
     seconds = round(time.time() - t0, 2)
     logs = (result.stdout + "\n" + result.stderr)[-6000:]
@@ -408,13 +365,6 @@ def do_swap(inp):
     folder = tempfile.mkdtemp(prefix="faceswap_swap_", dir=WORK_ROOT)
 
     try:
-        wrapper_dir = os.path.join(folder, "bin")
-        os.makedirs(wrapper_dir, exist_ok=True)
-        install_nvidia_smi_wrapper(wrapper_dir)
-
-        env = os.environ.copy()
-        env["PATH"] = wrapper_dir + os.pathsep + env.get("PATH", "")
-
         target = save_input(media, folder, "target", ".mp4" if is_video else ".jpg")
         if is_video:
             fixed = os.path.join(folder, "target_fixed.mp4")
@@ -440,7 +390,7 @@ def do_swap(inp):
                     selector_mode="reference",
                     reference_face_position=int(swap.get("position", idx))
                 )
-                code, seconds, logs = run_facefusion(cmd, env=env)
+                code, seconds, logs = run_facefusion(cmd)
                 total_seconds += seconds
                 last_logs = logs
                 if code != 0 or not os.path.isfile(out_path):
@@ -464,7 +414,7 @@ def do_swap(inp):
                 selector_mode=str(inp.get("selector_mode", "many")),
                 reference_face_position=int(inp.get("reference_face_position", 0))
             )
-            code, seconds, logs = run_facefusion(cmd, env=env)
+            code, seconds, logs = run_facefusion(cmd)
             total_seconds += seconds
             last_logs = logs
             if code != 0 or not os.path.isfile(out_path):
@@ -486,7 +436,8 @@ def do_swap(inp):
             "metrics": {
                 "model": model_used,
                 "seconds": round(total_seconds, 2),
-                "output_mb": round(os.path.getsize(current_target) / 1048576, 2)
+                "output_mb": round(os.path.getsize(current_target) / 1048576, 2),
+                "execution_provider": EXECUTION_PROVIDER
             },
             "log_tail": last_logs[-1000:]
         }
@@ -504,7 +455,8 @@ def handler(event):
                 "gpu": gpu_state(),
                 "onnxruntime": onnx_state(),
                 "models": list(MODELS),
-                "python": sys.version
+                "python": sys.version,
+                "execution_provider": EXECUTION_PROVIDER
             }
         if action == "detect":
             return do_detect(inp)
