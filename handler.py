@@ -24,7 +24,7 @@ try:
     os.makedirs("/app/checkpoints", exist_ok=True)
     
     models_to_check = {
-        "/app/checkpoints/inswapper_128.onnx": "https://huggingface.co/ezioruan/insightface_inswapper/resolve/main/inswapper_128.onnx",
+        "/app/checkpoints/inswapper_128.onnx": "https://github.com/deepinsight/insightface/releases/download/v0.7/inswapper_128.onnx",
         "/app/checkpoints/face_occluder.onnx": "https://github.com/facefusion/facefusion-assets/releases/download/models/face_occluder.onnx",
         "/app/checkpoints/enhancer.onnx": "https://github.com/facefusion/facefusion-assets/releases/download/models/codeformer.onnx"
     }
