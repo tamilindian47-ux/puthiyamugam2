@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 FROM python:3.11-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -28,21 +30,14 @@ RUN git clone --depth 1 https://github.com/facefusion/facefusion.git ${FACEFUSIO
 
 RUN python - <<'PY'
 from pathlib import Path
+import re
+
 p = Path("/opt/facefusion/facefusion/execution.py")
 text = p.read_text()
 
-old = """def create_value_and_unit(text : str) -> Optional[ValueAndUnit]:
-\tif ' ' in text:
-\t\tvalue, unit = text.split()
-\t\treturn\
-\t\t{
-\t\t\t'value': int(value),
-\t\t\t'unit': str(unit)
-\t\t}
-\treturn None
-"""
+pattern = r"def create_value_and_unit\\(text\\s*:\\s*str\\)\\s*->\\s*Optional\\[ValueAndUnit\\]:\\n(?:\\t|    ).*?(?=\\ndef |\\nclass |\\Z)"
 
-new = """def create_value_and_unit(text : str) -> Optional[ValueAndUnit]:
+replacement = '''def create_value_and_unit(text : str) -> Optional[ValueAndUnit]:
 \tif not text:
 \t\treturn None
 \ttext = str(text).strip()
@@ -60,12 +55,13 @@ new = """def create_value_and_unit(text : str) -> Optional[ValueAndUnit]:
 \t\texcept Exception:
 \t\t\treturn None
 \treturn None
-"""
+'''
 
-if old not in text:
-    raise SystemExit("Expected create_value_and_unit block not found in execution.py")
+new_text, count = re.subn(pattern, replacement, text, flags=re.S)
+if count != 1:
+    raise SystemExit(f"Expected to patch 1 function, patched {count}")
 
-p.write_text(text.replace(old, new))
+p.write_text(new_text)
 print("Patched FaceFusion execution.py")
 PY
 
