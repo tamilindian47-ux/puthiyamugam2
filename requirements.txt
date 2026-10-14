@@ -2,5 +2,5 @@ runpod
 requests
 numpy
 opencv-python-headless
-insightface==0.7.3
 onnxruntime-gpu
+insightface==0.7.3
