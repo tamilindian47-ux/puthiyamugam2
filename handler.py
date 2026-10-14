@@ -20,19 +20,32 @@ print("=== Starting Worker Initialization ===")
 sys.stdout.flush()
 
 try:
-    # Ensure checkpoints directory exists and auto-download missing models
+    # Ensure checkpoints directory exists
     os.makedirs("/app/checkpoints", exist_ok=True)
     
+    # Correct release URLs (using models-3.0.0 tag to prevent 404 Not Found)
     models_to_check = {
-        "/app/checkpoints/inswapper_128.onnx": "https://github.com/deepinsight/insightface/releases/download/v0.7/inswapper_128.onnx",
-        "/app/checkpoints/face_occluder.onnx": "https://github.com/facefusion/facefusion-assets/releases/download/models/face_occluder.onnx",
-        "/app/checkpoints/enhancer.onnx": "https://github.com/facefusion/facefusion-assets/releases/download/models/codeformer.onnx"
+        "/app/checkpoints/inswapper_128.onnx": (
+            "https://github.com/deepinsight/insightface/releases/download/v0.7/inswapper_128.onnx"
+        ),
+        "/app/checkpoints/face_occluder.onnx": (
+            "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/face_occluder.onnx"
+        ),
+        "/app/checkpoints/enhancer.onnx": (
+            "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/codeformer.onnx"
+        )
     }
 
+    # Safe downloader with browser headers (bypasses HuggingFace/GitHub 401 & 403 blocks)
     for path, url in models_to_check.items():
-        if not os.path.exists(path):
-            print(f"Model file missing at {path}. Downloading from {url}...")
-            urllib.request.urlretrieve(url, path)
+        if not os.path.exists(path) or os.path.getsize(path) < 1000:
+            print(f"Model file missing or corrupted at {path}. Downloading from {url}...")
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+            )
+            with urllib.request.urlopen(req, timeout=180) as resp, open(path, "wb") as f:
+                f.write(resp.read())
             print(f"Successfully downloaded: {path}")
 
     available_providers = ort.get_available_providers()
@@ -42,12 +55,16 @@ try:
 
     providers = [("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"})]
 
+    # Pre-load InsightFace buffalo_l models
     face_app = insightface.app.FaceAnalysis(
-        name="buffalo_l", root="/root/.insightface",
-        allowed_modules=['detection', 'recognition'], providers=providers
+        name="buffalo_l",
+        root="/root/.insightface",
+        allowed_modules=['detection', 'recognition'],
+        providers=providers
     )
     face_app.prepare(ctx_id=0, det_thresh=0.35, det_size=(640, 640))
 
+    # Initialize sessions
     swapper = insightface.model_zoo.get_model(
         "/app/checkpoints/inswapper_128.onnx", download=False, providers=providers
     )
@@ -63,6 +80,7 @@ except Exception as init_err:
     sys.stdout.flush()
     raise init_err
 
+# Initialize model geometry shapes
 occ_input = occ_session.get_inputs()[0]
 occ_shape = occ_input.shape
 occ_nchw = (len(occ_shape) == 4 and occ_shape[1] == 3)
@@ -199,13 +217,18 @@ def cluster_embeddings_numpy(detections, threshold=0.42):
 def detect_characters_from_media(media_bytes: bytes, is_video: bool):
     detections = []
     tmp_path = None
+    
+    # Auto-detect GIF header bytes (GIF87a or GIF89a) to treat it as animated/multi-frame
+    is_gif = media_bytes[:6] in (b"GIF87a", b"GIF89a")
+    treat_as_multi_frame = is_video or is_gif
+
     try:
-        ext = ".mp4" if is_video else ".jpg"
+        ext = ".gif" if is_gif else (".mp4" if is_video else ".jpg")
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
             tmp.write(media_bytes)
             tmp_path = tmp.name
             
-        if not is_video:
+        if not treat_as_multi_frame:
             frame = cv2.imread(tmp_path)
             if frame is not None:
                 for f in face_app.get(frame):
@@ -246,8 +269,10 @@ def detect_characters_from_media(media_bytes: bytes, is_video: bool):
         return cluster_embeddings_numpy(detections)
     finally:
         if tmp_path and os.path.exists(tmp_path):
-            try: os.remove(tmp_path)
-            except: pass
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
 def apply_swaps(frame, swap_targets, enhance=False):
@@ -276,7 +301,8 @@ def execute_swap(media_bytes, is_video, swap_targets, pipeline="codeformer"):
     if not is_video:
         frame = apply_swaps(cv2.imread(tmp_input), swap_targets, enhance)
         _, out_buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 97])
-        if os.path.exists(tmp_input): os.remove(tmp_input)
+        if os.path.exists(tmp_input):
+            os.remove(tmp_input)
         return {"status": "success", "mediatype": "image", "base64": base64.b64encode(out_buf).decode("utf-8")}
 
     tmp_mp4 = f"/tmp/final_{temp_id}.mp4"
