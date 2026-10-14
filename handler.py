@@ -5,7 +5,7 @@ import uuid
 import base64
 import traceback
 import subprocess
-import requests
+import urllib.request
 import numpy as np
 import onnxruntime as ort
 import insightface
@@ -19,11 +19,6 @@ print("=== Starting Worker Initialization ===")
 sys.stdout.flush()
 
 try:
-    try:
-        ort.preload_dlls()
-    except Exception as preload_err:
-        print(f"preload_dlls warning: {preload_err}")
-
     available_providers = ort.get_available_providers()
     print(f"Available ONNX providers detected: {available_providers}")
     if 'CUDAExecutionProvider' not in available_providers:
@@ -38,10 +33,10 @@ try:
     face_app.prepare(ctx_id=0, det_thresh=0.35, det_size=(640, 640))
 
     swapper = insightface.model_zoo.get_model(
-        "/app/checkpoints/inswapper_128.onnx", download=False, providers=providers
+        "/app/models/inswapper128.onnx", download=False, providers=providers
     )
-    occ_session = ort.InferenceSession("/app/checkpoints/face_occluder.onnx", providers=providers)
-    enh_session = ort.InferenceSession("/app/checkpoints/enhancer.onnx", providers=providers)
+    occ_session = ort.InferenceSession("/app/models/face_occluder.onnx", providers=providers)
+    enh_session = ort.InferenceSession("/app/models/enhancer.onnx", providers=providers)
 
     print("=== Worker Successfully Initialized: Models Residing in VRAM ===")
     sys.stdout.flush()
@@ -145,18 +140,11 @@ def resolve_media_to_bytes(media_str: str) -> bytes:
     return base64.b64decode(media_str)
 
 
-def encode_jpg_b64(img_bgr: np.ndarray) -> str:
-    ok, buf = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-    if not ok:
-        raise ValueError("Failed to encode thumbnail image.")
-    return base64.b64encode(buf).decode("utf-8")
-
-
 def decode_image(data_or_url):
     temp = f"/tmp/img_{uuid.uuid4().hex[:6]}.jpg"
     try:
-        resolve_input_to_file = lambda d, p: open(p, "wb").write(resolve_media_to_bytes(d))
-        resolve_input_to_file(data_or_url, temp)
+        with open(temp, "wb") as f:
+            f.write(resolve_media_to_bytes(data_or_url))
         return cv2.imread(temp)
     finally:
         if os.path.exists(temp):
