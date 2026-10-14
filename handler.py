@@ -33,12 +33,12 @@ try:
     )
     face_app.prepare(ctx_id=0, det_thresh=0.35, det_size=(640, 640))
 
-    # Updated to look for the file with the underscore matching your checkpoint path
+    # Updated path to match the /app/checkpoints/ directory
     swapper = insightface.model_zoo.get_model(
-        "/app/models/inswapper_128.onnx", download=False, providers=providers
+        "/app/checkpoints/inswapper_128.onnx", download=False, providers=providers
     )
-    occ_session = ort.InferenceSession("/app/models/face_occluder.onnx", providers=providers)
-    enh_session = ort.InferenceSession("/app/models/enhancer.onnx", providers=providers)
+    occ_session = ort.InferenceSession("/app/checkpoints/face_occluder.onnx", providers=providers)
+    enh_session = ort.InferenceSession("/app/checkpoints/enhancer.onnx", providers=providers)
 
     print("=== Worker Successfully Initialized: Models Residing in VRAM ===")
     sys.stdout.flush()
