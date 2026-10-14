@@ -20,6 +20,21 @@ print("=== Starting Worker Initialization ===")
 sys.stdout.flush()
 
 try:
+    # Ensure checkpoints directory exists and auto-download missing models
+    os.makedirs("/app/checkpoints", exist_ok=True)
+    
+    models_to_check = {
+        "/app/checkpoints/inswapper_128.onnx": "https://huggingface.co/ezioruan/insightface_inswapper/resolve/main/inswapper_128.onnx",
+        "/app/checkpoints/face_occluder.onnx": "https://github.com/facefusion/facefusion-assets/releases/download/models/face_occluder.onnx",
+        "/app/checkpoints/enhancer.onnx": "https://github.com/facefusion/facefusion-assets/releases/download/models/codeformer.onnx"
+    }
+
+    for path, url in models_to_check.items():
+        if not os.path.exists(path):
+            print(f"Model file missing at {path}. Downloading from {url}...")
+            urllib.request.urlretrieve(url, path)
+            print(f"Successfully downloaded: {path}")
+
     available_providers = ort.get_available_providers()
     print(f"Available ONNX providers detected: {available_providers}")
     if 'CUDAExecutionProvider' not in available_providers:
@@ -33,7 +48,6 @@ try:
     )
     face_app.prepare(ctx_id=0, det_thresh=0.35, det_size=(640, 640))
 
-    # Updated path to match the /app/checkpoints/ directory
     swapper = insightface.model_zoo.get_model(
         "/app/checkpoints/inswapper_128.onnx", download=False, providers=providers
     )
