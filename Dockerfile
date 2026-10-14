@@ -10,11 +10,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git wget curl unzip ffmpeg libgl1 libglib2.0-0 build-essential ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone official FaceFusion engine for robust multi-processor handling
 RUN git clone https://github.com/facefusion/facefusion.git /app/facefusion
 WORKDIR /app/facefusion
 
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN pip install --upgrade pip && \
+    pip install -r requirements.txt || true && \
+    pip install "numpy<2.0.0" --force-reinstall
 
 COPY handler.py /app/handler.py
 
