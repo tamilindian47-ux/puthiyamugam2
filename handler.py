@@ -1,401 +1,451 @@
 import os
-import sys
+import io
 import cv2
-import uuid
 import base64
-import traceback
-import subprocess
-import urllib.request
 import tempfile
+import subprocess
 import numpy as np
 import onnxruntime as ort
 import insightface
+from insightface.app import FaceAnalysis
+from PIL import Image, ImageSequence
 import runpod
 
-CRF = os.environ.get("OUTPUT_CRF", "17")
-PRESET = os.environ.get("OUTPUT_PRESET", "fast")
-ENHANCE_BLEND = float(os.environ.get("ENHANCE_BLEND", "0.7"))
+INSWAPPERPATH = os.environ.get("INSWAPPERPATH", "models/inswapper128.onnx")
+GFPGANPATH = "models/GFPGANv1.4.pth"
 
-print("=== Starting Worker Initialization ===")
-sys.stdout.flush()
+CLUSTER_THRESH = 0.45
+MATCH_THRESH = 0.40
+DETECT_SAMPLES = 30
 
-try:
-    # Ensure checkpoints directory exists
-    os.makedirs("/app/checkpoints", exist_ok=True)
-    
-    # Correct release URLs (using models-3.0.0 tag to prevent 404 Not Found)
-    models_to_check = {
-        "/app/checkpoints/inswapper_128.onnx": (
-            "https://github.com/deepinsight/insightface/releases/download/v0.7/inswapper_128.onnx"
-        ),
-        "/app/checkpoints/face_occluder.onnx": (
-            "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/face_occluder.onnx"
-        ),
-        "/app/checkpoints/enhancer.onnx": (
-            "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/codeformer.onnx"
-        )
-    }
+PROVIDERS = [
+    (
+        "CUDAExecutionProvider",
+        {
+            "device_id": 0,
+            "arena_extend_strategy": "kSameAsRequested",
+            "gpu_mem_limit": 6 * 1024 * 1024 * 1024,
+            "cudnn_conv_algo_search": "HEURISTIC",
+        },
+    ),
+    "CPUExecutionProvider",
+]
 
-    # Safe downloader with browser headers (bypasses HuggingFace/GitHub 401 & 403 blocks)
-    for path, url in models_to_check.items():
-        if not os.path.exists(path) or os.path.getsize(path) < 1000:
-            print(f"Model file missing or corrupted at {path}. Downloading from {url}...")
-            req = urllib.request.Request(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+print("Worker ORT providers:", ort.get_available_providers(), flush=True)
+assert "CUDAExecutionProvider" in ort.get_available_providers(), "CUDA provider missing"
+
+app = FaceAnalysis(
+    name="buffalo_l",
+    providers=PROVIDERS,
+    allowed_modules=["detection", "recognition"],
+)
+app.prepare(ctx_id=0, det_size=(640, 640), det_thresh=0.4)
+
+swapper = insightface.model_zoo.get_model(INSWAPPERPATH, providers=PROVIDERS)
+assert swapper.session.get_providers()[0] == "CUDAExecutionProvider", "Swapper fell back to CPU"
+
+print("Worker Ready on GPU.", flush=True)
+
+gfpgan = None
+
+
+def get_gfpgan():
+    global gfpgan
+    if gfpgan is None:
+        try:
+            from gfpgan import GFPGANer
+
+            gfpgan = GFPGANer(
+                model_path=GFPGANPATH,
+                upscale=1,
+                arch="clean",
+                channel_multiplier=2,
+                bg_upsampler=None,
             )
-            with urllib.request.urlopen(req, timeout=180) as resp, open(path, "wb") as f:
-                f.write(resp.read())
-            print(f"Successfully downloaded: {path}")
-
-    available_providers = ort.get_available_providers()
-    print(f"Available ONNX providers detected: {available_providers}")
-    if 'CUDAExecutionProvider' not in available_providers:
-        raise RuntimeError(f"FATAL: CUDAExecutionProvider not found! Detected: {available_providers}")
-
-    providers = [("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"})]
-
-    # Pre-load InsightFace buffalo_l models
-    face_app = insightface.app.FaceAnalysis(
-        name="buffalo_l",
-        root="/root/.insightface",
-        allowed_modules=['detection', 'recognition'],
-        providers=providers
-    )
-    face_app.prepare(ctx_id=0, det_thresh=0.35, det_size=(640, 640))
-
-    # Initialize sessions
-    swapper = insightface.model_zoo.get_model(
-        "/app/checkpoints/inswapper_128.onnx", download=False, providers=providers
-    )
-    occ_session = ort.InferenceSession("/app/checkpoints/face_occluder.onnx", providers=providers)
-    enh_session = ort.InferenceSession("/app/checkpoints/enhancer.onnx", providers=providers)
-
-    print("=== Worker Successfully Initialized: Models Residing in VRAM ===")
-    sys.stdout.flush()
-
-except Exception as init_err:
-    print("FATAL INITIALIZATION ERROR:")
-    traceback.print_exc()
-    sys.stdout.flush()
-    raise init_err
-
-# Initialize model geometry shapes
-occ_input = occ_session.get_inputs()[0]
-occ_shape = occ_input.shape
-occ_nchw = (len(occ_shape) == 4 and occ_shape[1] == 3)
-try:
-    occ_size = (int(occ_shape[3]), int(occ_shape[2])) if occ_nchw else (int(occ_shape[2]), int(occ_shape[1]))
-except Exception:
-    occ_size = (256, 256)
-
-enh_input_name = enh_session.get_inputs()[0].name
-enh_size = int(enh_session.get_inputs()[0].shape[2])
-FFHQ_TEMPLATE = np.array([
-    [0.37691676, 0.46864664], [0.62285697, 0.46912813], [0.50123859, 0.61331904],
-    [0.39308822, 0.72541100], [0.61150205, 0.72490465],
-], dtype=np.float32) * enh_size
+        except Exception as e:
+            print("Worker GFPGAN unavailable:", e, flush=True)
+            gfpgan = False
+    return gfpgan
 
 
-def occlusion_mask(crop_bgr):
-    img = cv2.resize(crop_bgr, occ_size).astype(np.float32) / 255.0
-    if occ_nchw:
-        img = img.transpose(2, 0, 1)
-    out = occ_session.run(None, {occ_input.name: img[None]})[0][0]
-    m = np.clip(np.squeeze(out), 0, 1).astype(np.float32)
-    m = cv2.resize(m, (crop_bgr.shape[1], crop_bgr.shape[0]))
-    m = (np.clip(cv2.GaussianBlur(m, (0, 0), 5), 0.5, 1) - 0.5) * 2
-    return m
+def b64_to_bytes(s):
+    if "," in s[:100]:
+        s = s.split(",", 1)[1]
+    return base64.b64decode(s)
 
 
-def box_mask(size=128, blur=0.5):
-    amount = int(size * 0.5 * blur)
-    edge = max(amount // 2, 1)
-    m = np.ones((size, size), np.float32)
-    m[:edge, :] = 0
-    m[-edge:, :] = 0
-    m[:, :edge] = 0
-    m[:, -edge:] = 0
-    return cv2.GaussianBlur(m, (0, 0), max(amount * 0.25, 0.1))
+def bytes_to_img(data):
+    return cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
 
 
-def swap_face(frame, face, source_face):
-    bgr_fake, M = swapper.get(frame, face, source_face, paste_back=False)
-    bgr_fake = np.ascontiguousarray(bgr_fake)
-    h, w = frame.shape[:2]
-    crop = cv2.warpAffine(frame, M, (128, 128), borderValue=0)
-    mask = np.minimum(box_mask(), occlusion_mask(crop))
-    IM = cv2.invertAffineTransform(M)
-    fake_w = cv2.warpAffine(bgr_fake, IM, (w, h), borderValue=0).astype(np.float32)
-    mask_w = cv2.warpAffine(mask, IM, (w, h), borderValue=0)[:, :, None]
-    out = frame.astype(np.float32) * (1 - mask_w) + fake_w * mask_w
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-def run_enhancer(crop_bgr):
-    x = crop_bgr[:, :, ::-1].astype(np.float32) / 255.0
-    x = (x - 0.5) / 0.5
-    x = np.ascontiguousarray(x.transpose(2, 0, 1)[None])
-    y = enh_session.run(None, {enh_input_name: x})[0][0]
-    y = (np.clip(y, -1, 1) + 1) / 2
-    y = np.clip(np.rint(y.transpose(1, 2, 0) * 255), 0, 255).astype(np.uint8)
-    return np.ascontiguousarray(y[:, :, ::-1])
-
-
-def enhance_face(swapped, original, face, blend=ENHANCE_BLEND):
-    kps = face.kps.astype(np.float32)
-    M, _ = cv2.estimateAffinePartial2D(kps, FFHQ_TEMPLATE, method=cv2.LMEDS)
-    if M is None:
-        return swapped
-    h, w = swapped.shape[:2]
-    s = enh_size
-    crop = cv2.warpAffine(swapped, M, (s, s), borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_AREA)
-    orig_crop = cv2.warpAffine(original, M, (s, s), borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_AREA)
-    enhanced = run_enhancer(crop)
-    enhanced = crop.astype(np.float32) * (1 - blend) + enhanced.astype(np.float32) * blend
-    mask = np.minimum(box_mask(s, 0.3), occlusion_mask(orig_crop))
-    IM = cv2.invertAffineTransform(M)
-    enh_w = cv2.warpAffine(enhanced, IM, (w, h), flags=cv2.INTER_LINEAR, borderValue=0)
-    mask_w = cv2.warpAffine(mask, IM, (w, h), flags=cv2.INTER_LINEAR, borderValue=0)[:, :, None]
-    out = swapped.astype(np.float32) * (1 - mask_w) + enh_w.astype(np.float32) * mask_w
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-def resolve_media_to_bytes(media_str: str) -> bytes:
-    if not media_str:
-        return None
-    media_str = media_str.strip()
-    if media_str.startswith("http://") or media_str.startswith("https://"):
-        req = urllib.request.Request(media_str, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read()
-    if "," in media_str and media_str.startswith("data:"):
-        media_str = media_str.split(",", 1)[1]
-    return base64.b64decode(media_str)
-
-
-def decode_image(data_or_url):
-    temp = f"/tmp/img_{uuid.uuid4().hex[:6]}.jpg"
-    try:
-        with open(temp, "wb") as f:
-            f.write(resolve_media_to_bytes(data_or_url))
-        return cv2.imread(temp)
-    finally:
-        if os.path.exists(temp):
-            os.remove(temp)
-
-
-def cluster_embeddings_numpy(detections, threshold=0.42):
-    clusters = []
-    for i, d in enumerate(detections):
-        vec = d['embedding']
-        matched = False
-        for c in clusters:
-            centroid = np.mean([detections[idx]['embedding'] for idx in c], axis=0)
-            centroid = centroid / np.linalg.norm(centroid)
-            if float(np.dot(vec, centroid)) >= (1.0 - threshold):
-                c.append(i)
-                matched = True
-                break
-        if not matched:
-            clusters.append([i])
-
-    unique_characters = []
-    for l, c_indices in enumerate(clusters):
-        best_idx = max(c_indices, key=lambda idx: detections[idx]['score'])
-        centroid = np.mean([detections[idx]['embedding'] for idx in c_indices], axis=0)
-        centroid = centroid / np.linalg.norm(centroid)
-        _, buf = cv2.imencode(".jpg", detections[best_idx]['crop'])
-        unique_characters.append({
-            "index": int(l),
-            "thumbnailbase64": base64.b64encode(buf).decode("utf-8"),
-            "embedding": centroid.tolist()
-        })
-    return unique_characters
-
-
-def detect_characters_from_media(media_bytes: bytes, is_video: bool):
-    detections = []
-    tmp_path = None
-    
-    # Auto-detect GIF header bytes (GIF87a or GIF89a) to treat it as animated/multi-frame
-    is_gif = media_bytes[:6] in (b"GIF87a", b"GIF89a")
-    treat_as_multi_frame = is_video or is_gif
-
-    try:
-        ext = ".gif" if is_gif else (".mp4" if is_video else ".jpg")
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            tmp.write(media_bytes)
-            tmp_path = tmp.name
-            
-        if not treat_as_multi_frame:
-            frame = cv2.imread(tmp_path)
-            if frame is not None:
-                for f in face_app.get(frame):
-                    box = f.bbox.astype(int)
-                    x1, y1 = max(0, box[0]), max(0, box[1])
-                    x2, y2 = min(frame.shape[1], box[2]), min(frame.shape[0], box[3])
-                    if x2 > x1 and y2 > y1:
-                        detections.append({
-                            'crop': frame[y1:y2, x1:x2],
-                            'embedding': f.normed_embedding,
-                            'score': (x2 - x1) * (y2 - y1)
-                        })
-        else:
-            cap = cv2.VideoCapture(tmp_path)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 100
-            step = max(1, total_frames // 30)
-            frame_idx = 0
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                if frame_idx % step == 0:
-                    for f in face_app.get(frame):
-                        box = f.bbox.astype(int)
-                        x1, y1 = max(0, box[0]), max(0, box[1])
-                        x2, y2 = min(frame.shape[1], box[2]), min(frame.shape[0], box[3])
-                        if (x2 - x1) > 40 and (y2 - y1) > 40:
-                            detections.append({
-                                'crop': frame[y1:y2, x1:x2],
-                                'embedding': f.normed_embedding,
-                                'score': (x2 - x1) * (y2 - y1)
-                            })
-                frame_idx += 1
-            cap.release()
-
-        if not detections:
-            return []
-        return cluster_embeddings_numpy(detections)
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-
-
-def apply_swaps(frame, swap_targets, enhance=False):
-    for face in face_app.get(frame):
-        for target in swap_targets:
-            sim = float(np.dot(face.normed_embedding, target["target_embedding"]))
-            if sim >= 0.40:
-                original = frame
-                frame = swap_face(frame, face, target["source_face"])
-                if enhance:
-                    frame = enhance_face(frame, original, face)
-                break
-    return frame
-
-
-def execute_swap(media_bytes, is_video, swap_targets, pipeline="codeformer"):
-    enhance = pipeline != "none"
-    print(f"Pipeline: {pipeline} | enhance={enhance} | CRF={CRF} preset={PRESET}")
-
-    temp_id = uuid.uuid4().hex[:8]
-    ext = ".mp4" if is_video else ".jpg"
-    tmp_input = f"/tmp/input_{temp_id}{ext}"
-    with open(tmp_input, "wb") as f:
-        f.write(media_bytes)
-
-    if not is_video:
-        frame = apply_swaps(cv2.imread(tmp_input), swap_targets, enhance)
-        _, out_buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 97])
-        if os.path.exists(tmp_input):
-            os.remove(tmp_input)
-        return {"status": "success", "mediatype": "image", "base64": base64.b64encode(out_buf).decode("utf-8")}
-
-    tmp_mp4 = f"/tmp/final_{temp_id}.mp4"
-    cap = cv2.VideoCapture(tmp_input)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    if fps <= 0 or fps > 120:
-        fps = 25.0
-    ok, first = cap.read()
+def img_to_b64(img, ext=".jpg"):
+    ok, buf = cv2.imencode(ext, img)
     if not ok:
-        cap.release()
-        raise RuntimeError("Could not read first frame of video")
-    h, w = first.shape[:2]
-    w2, h2 = w - (w % 2), h - (h % 2)
+        raise ValueError("Failed to encode image")
+    return base64.b64encode(buf).decode("utf-8")
 
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w2}x{h2}", "-r", f"{fps}", "-i", "-",
-        "-i", tmp_input,
-        "-map", "0:v:0", "-map", "1:a:0?",
-        "-c:v", "libx264", "-preset", PRESET, "-crf", CRF, "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart",
-        tmp_mp4
-    ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
-    frame = first
-    try:
-        while True:
-            out = apply_swaps(frame, swap_targets, enhance)
-            if out.shape[1] != w2 or out.shape[0] != h2:
-                out = out[:h2, :w2]
-            proc.stdin.write(np.ascontiguousarray(out).tobytes())
-            ret, frame = cap.read()
-            if not ret:
+def sniff_kind(data, isvideo_hint):
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if data[4:8] == b"ftyp" or data[:4] == b"\u001AEß£" or data[:4] == b"RIFF":
+        return "video"
+    return "video" if isvideo_hint else "image"
+
+
+def cosine(a, b):
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
+
+
+def write_temp(data, suffix):
+    f = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    f.write(data)
+    f.close()
+    return f.name
+
+
+def gif_frames(data):
+    im = Image.open(io.BytesIO(data))
+    frames = []
+    durations = []
+    for fr in ImageSequence.Iterator(im):
+        durations.append(fr.info.get("duration", 80))
+        frames.append(cv2.cvtColor(np.array(fr.convert("RGB")), cv2.COLOR_RGB2BGR))
+    return frames, durations
+
+
+def sample_video_frames(path, n):
+    cap = cv2.VideoCapture(path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    frames = []
+
+    if total > 0:
+        idxs = np.linspace(0, total - 1, min(n, total)).astype(int)
+        for i in idxs:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
+            ok, fr = cap.read()
+            if ok:
+                frames.append(fr)
+    else:
+        while len(frames) < n:
+            ok, fr = cap.read()
+            if not ok:
                 break
-    finally:
-        cap.release()
-        proc.stdin.close()
-        rc = proc.wait()
+            frames.append(fr)
 
-    if rc != 0:
-        raise RuntimeError(f"ffmpeg encode failed with code {rc}")
-
-    with open(tmp_mp4, "rb") as f:
-        media_b64 = base64.b64encode(f.read()).decode("utf-8")
-
-    for fpath in [tmp_input, tmp_mp4]:
-        if os.path.exists(fpath):
-            os.remove(fpath)
-
-    return {"status": "success", "mediatype": "video", "base64": media_b64}
+    cap.release()
+    return frames
 
 
-def handler(event):
+def crop_face(img, face):
+    h, w = img.shape[:2]
+    x1, y1, x2, y2 = face.bbox.astype(int)
+    px, py = int((x2 - x1) * 0.15), int((y2 - y1) * 0.15)
+    x1, y1 = max(0, x1 - px), max(0, y1 - py)
+    x2, y2 = min(w, x2 + px), min(h, y2 + py)
+    return img[y1:y2, x1:x2]
+
+
+def cluster_faces(frames):
+    clusters = []
+
+    for frame in frames:
+        faces = app.get(frame)
+        for f in faces:
+            emb = f.embedding / (np.linalg.norm(f.embedding) + 1e-9)
+            matched = False
+
+            for cluster in clusters:
+                centroid = np.mean([x["embedding"] for x in cluster], axis=0)
+                centroid = centroid / (np.linalg.norm(centroid) + 1e-9)
+                if float(np.dot(emb, centroid)) >= (1.0 - CLUSTER_THRESH):
+                    cluster.append(
+                        {
+                            "embedding": emb,
+                            "face": f,
+                            "crop": crop_face(frame, f),
+                            "score": float(
+                                (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])
+                            ),
+                        }
+                    )
+                    matched = True
+                    break
+
+            if not matched:
+                clusters.append(
+                    [
+                        {
+                            "embedding": emb,
+                            "face": f,
+                            "crop": crop_face(frame, f),
+                            "score": float(
+                                (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])
+                            ),
+                        }
+                    ]
+                )
+
+    characters = []
+    for idx, cluster in enumerate(clusters):
+        best = max(cluster, key=lambda x: x["score"])
+        centroid = np.mean([x["embedding"] for x in cluster], axis=0)
+        centroid = centroid / (np.linalg.norm(centroid) + 1e-9)
+        thumb = img_to_b64(best["crop"])
+        characters.append(
+            {
+                "characterId": idx,
+                "thumbnailBase64": thumb,
+                "embedding": centroid.tolist(),
+            }
+        )
+
+    return characters
+
+
+def build_assignments(swaps):
+    assignments = []
+    for s in swaps:
+        src_b64 = s.get("newFace") or s.get("sourceImage")
+        target_embedding = s.get("targetEmbedding")
+        if not src_b64 or target_embedding is None:
+            continue
+
+        src_img = bytes_to_img(b64_to_bytes(src_b64))
+        if src_img is None:
+            continue
+
+        src_faces = app.get(src_img)
+        if not src_faces:
+            continue
+
+        largest = max(
+            src_faces,
+            key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
+        )
+
+        assignments.append(
+            {
+                "target_embedding": np.asarray(target_embedding, dtype=np.float32),
+                "source_face": largest,
+            }
+        )
+
+    return assignments
+
+
+def find_matching_swap(face_embedding, assignments, threshold=MATCH_THRESH):
+    best_src = None
+    best_sim = -1.0
+    for s in assignments:
+        sim = cosine(face_embedding, s["target_embedding"])
+        if sim >= threshold and sim > best_sim:
+            best_sim = sim
+            best_src = s["source_face"]
+    return best_src
+
+
+def apply_enhancer(img, pipeline):
+    if pipeline not in (None, "", "fast", "pipeline1", "1"):
+        restorer = get_gfpgan()
+        if restorer not in (None, False):
+            try:
+                _, _, out = restorer.enhance(img, paste_back=True)
+                return out
+            except Exception as e:
+                print("GFPGAN failed:", e, flush=True)
+    return img
+
+
+def process_frame(frame, assignments, enhance=False, pipeline="fast"):
+    faces = app.get(frame)
+    if not faces:
+        return frame
+
+    out = frame.copy()
+    for face in faces:
+        src_face = find_matching_swap(face.embedding, assignments)
+        if src_face is not None:
+            out = swapper.get(out, face, src_face, paste_back=True)
+
+    if enhance:
+        out = apply_enhancer(out, pipeline)
+
+    return out
+
+
+def handle_detect(media_b64, isvideo):
+    data = b64_to_bytes(media_b64)
+    kind = sniff_kind(data, isvideo)
+
+    if kind == "image":
+        img = bytes_to_img(data)
+        if img is None:
+            return {"error": "Could not decode image"}
+        frames = [img]
+
+    elif kind == "gif":
+        all_frames, _ = gif_frames(data)
+        idxs = np.linspace(0, len(all_frames) - 1, min(DETECT_SAMPLES, len(all_frames))).astype(int)
+        frames = [all_frames[i] for i in idxs]
+
+    else:
+        path = write_temp(data, ".mp4")
+        try:
+            frames = sample_video_frames(path, DETECT_SAMPLES)
+        finally:
+            os.remove(path)
+        if not frames:
+            return {"error": "Could not read video frames"}
+
+    return {"characters": cluster_faces(frames), "mediaKind": kind}
+
+
+def handle_swap(media_b64, isvideo, swaps, pipeline):
+    assignments = build_assignments(swaps)
+    if not assignments:
+        return {"error": "No usable face found in the replacement photos"}
+
+    enhance = pipeline not in (None, "", "fast", "pipeline1", "1")
+
+    data = b64_to_bytes(media_b64)
+    kind = sniff_kind(data, isvideo)
+
+    if kind == "image":
+        img = bytes_to_img(data)
+        if img is None:
+            return {"error": "Could not decode image"}
+        img = process_frame(img, assignments, enhance, pipeline)
+        return {"mediaType": "image", "base64": img_to_b64(img)}
+
+    if kind == "gif":
+        frames, durations = gif_frames(data)
+        out = []
+        for fr in frames:
+            fr = process_frame(fr, assignments, enhance, pipeline)
+            out.append(Image.fromarray(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)))
+
+        buf = io.BytesIO()
+        out[0].save(
+            buf,
+            format="GIF",
+            save_all=True,
+            append_images=out[1:],
+            duration=durations,
+            loop=0,
+            disposal=2,
+        )
+        return {
+            "mediaType": "gif",
+            "base64": base64.b64encode(buf.getvalue()).decode("utf-8"),
+        }
+
+    inpath = write_temp(data, ".mp4")
+    rawpath = inpath + ".raw.mp4"
+    finalpath = inpath + ".final.mp4"
+
     try:
-        jobinput = event.get("input", {}) or {}
-        action = (jobinput.get("action") or "swap").lower()
-        
-        media_raw = jobinput.get("media") or jobinput.get("targetimage") or jobinput.get("image")
-        if not media_raw:
-            return {"error": "Missing media payload in request."}
+        cap = cv2.VideoCapture(inpath)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        is_video = bool(jobinput.get("isvideo", False))
-        media_bytes = resolve_media_to_bytes(media_raw)
-        if not media_bytes:
-            return {"error": "Media buffer is empty."}
+        writer = cv2.VideoWriter(
+            rawpath,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (w, h),
+        )
 
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            writer.write(process_frame(frame, assignments, enhance, pipeline))
+
+        cap.release()
+        writer.release()
+
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                rawpath,
+                "-i",
+                inpath,
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0?",
+                "-shortest",
+                finalpath,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+
+        with open(finalpath, "rb") as f:
+            return {
+                "mediaType": "video",
+                "base64": base64.b64encode(f.read()).decode("utf-8"),
+            }
+
+    finally:
+        for p in (inpath, rawpath, finalpath):
+            if os.path.exists(p):
+                os.remove(p)
+
+
+def handler(job):
+    job_input = job.get("input", {})
+
+    action = job_input.get("action", "swap")
+    media_b64 = job_input.get("media") or job_input.get("targetImage") or job_input.get("targetimage")
+    isvideo = bool(job_input.get("isVideo", job_input.get("isvideo", False)))
+    pipeline = str(job_input.get("pipeline", "fast")).lower()
+
+    if not media_b64:
+        return {
+            "status": "failed",
+            "error": f"Missing media payload. Keys received: {list(job_input.keys())}",
+        }
+
+    try:
         if action == "detect":
-            characters = detect_characters_from_media(media_bytes, is_video)
-            return {"status": "success", "characters": characters}
+            result = handle_detect(media_b64, isvideo)
+            if "error" in result:
+                return {"status": "failed", "error": result["error"]}
+            return {
+                "status": "success",
+                "characters": result["characters"],
+                "mediaKind": result["mediaKind"],
+            }
 
         if action == "swap":
-            swaps_input = jobinput.get("swaps", [])
-            if not swaps_input:
-                return {"error": "Missing swaps list."}
+            swaps = job_input.get("swaps", [])
+            result = handle_swap(media_b64, isvideo, swaps, pipeline)
+            if "error" in result:
+                return {"status": "failed", "error": result["error"]}
+            return {
+                "status": "success",
+                "mediaType": result["mediaType"],
+                "base64": result["base64"],
+            }
 
-            pipeline = jobinput.get("enhancer", "codeformer")
-            swap_targets = []
-            for s in swaps_input:
-                src_faces = face_app.get(decode_image(s["newface"]))
-                if src_faces:
-                    swap_targets.append({
-                        "target_embedding": np.array(s["targetembedding"], dtype=np.float32),
-                        "source_face": src_faces[0]
-                    })
-            return execute_swap(media_bytes, is_video, swap_targets, pipeline)
-
-        return {"error": f"Unknown action: {action}"}
+        return {"status": "failed", "error": f"Invalid action: {action}"}
 
     except Exception as e:
-        traceback.print_exc()
-        return {"error": f"Unhandled worker error: {str(e)}"}
+        return {"status": "failed", "error": str(e)}
 
 
-if __name__ == "__main__":
-    runpod.serverless.start({"handler": handler})
+runpod.serverless.start({"handler": handler})
