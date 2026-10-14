@@ -26,10 +26,14 @@ REFERENCE_FACE_DISTANCE = float(os.getenv("REFERENCE_FACE_DISTANCE", "0.6"))
 os.makedirs(WORK_ROOT, exist_ok=True)
 
 MODELS = {
-    "inswapper": "inswapper_128", "inswapper_128": "inswapper_128",
-    "hyperswap_1a": "hyperswap_1a_256", "hyperswap_1a_256": "hyperswap_1a_256",
-    "hyperswap_1b": "hyperswap_1b_256", "hyperswap_1b_256": "hyperswap_1b_256",
-    "hyperswap_1c": "hyperswap_1c_256", "hyperswap_1c_256": "hyperswap_1c_256",
+    "inswapper": "inswapper_128",
+    "inswapper_128": "inswapper_128",
+    "hyperswap_1a": "hyperswap_1a_256",
+    "hyperswap_1a_256": "hyperswap_1a_256",
+    "hyperswap_1b": "hyperswap_1b_256",
+    "hyperswap_1b_256": "hyperswap_1b_256",
+    "hyperswap_1c": "hyperswap_1c_256",
+    "hyperswap_1c_256": "hyperswap_1c_256",
 }
 
 _face_app = None
@@ -427,4 +431,88 @@ def do_swap(inp):
             for idx, swap in enumerate(ordered_swaps):
                 source_path = save_input(swap["new_face"], folder, f"source_{idx}", ".jpg")
                 out_path = os.path.join(folder, f"pass_{idx}.{'mp4' if is_video else 'jpg'}")
-                cmd, model_used
+                cmd, model_used = facefusion_command(
+                    source_path,
+                    current_target,
+                    out_path,
+                    os.path.join(folder, f"temp_{idx}"),
+                    inp,
+                    selector_mode="reference",
+                    reference_face_position=int(swap.get("position", idx))
+                )
+                code, seconds, logs = run_facefusion(cmd, env=env)
+                total_seconds += seconds
+                last_logs = logs
+                if code != 0 or not os.path.isfile(out_path):
+                    return {
+                        "status": "failed",
+                        "error": "FaceFusion failed",
+                        "returncode": code,
+                        "log_tail": logs
+                    }
+                current_target = out_path
+        else:
+            src_list = sources or ([source] if source else [])
+            source_path = save_input(src_list[0], folder, "source_0", ".jpg")
+            out_path = os.path.join(folder, f"output.{'mp4' if is_video else 'jpg'}")
+            cmd, model_used = facefusion_command(
+                source_path,
+                current_target,
+                out_path,
+                os.path.join(folder, "temp_0"),
+                inp,
+                selector_mode=str(inp.get("selector_mode", "many")),
+                reference_face_position=int(inp.get("reference_face_position", 0))
+            )
+            code, seconds, logs = run_facefusion(cmd, env=env)
+            total_seconds += seconds
+            last_logs = logs
+            if code != 0 or not os.path.isfile(out_path):
+                return {
+                    "status": "failed",
+                    "error": "FaceFusion failed",
+                    "returncode": code,
+                    "log_tail": logs
+                }
+            current_target = out_path
+
+        with open(current_target, "rb") as f:
+            payload = base64.b64encode(f.read()).decode("ascii")
+
+        return {
+            "status": "success",
+            "media_type": "video" if is_video else "image",
+            "base64": payload,
+            "metrics": {
+                "model": model_used,
+                "seconds": round(total_seconds, 2),
+                "output_mb": round(os.path.getsize(current_target) / 1048576, 2)
+            },
+            "log_tail": last_logs[-1000:]
+        }
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def handler(event):
+    inp = event.get("input", {}) or {}
+    try:
+        action = inp.get("action")
+        if action == "info":
+            return {
+                "status": "success",
+                "gpu": gpu_state(),
+                "onnxruntime": onnx_state(),
+                "models": list(MODELS),
+                "python": sys.version
+            }
+        if action == "detect":
+            return do_detect(inp)
+        return do_swap(inp)
+    except Exception as e:
+        traceback.print_exc()
+        return {"status": "failed", "error": str(e)}
+
+
+if __name__ == "__main__":
+    runpod.serverless.start({"handler": handler})
