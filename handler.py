@@ -18,12 +18,10 @@ print("=== Starting Worker Initialization ===")
 sys.stdout.flush()
 
 try:
-    # Helpful debug info in serverless logs
     print("ORT version:", ort.__version__)
     print("ORT available providers:", ort.get_available_providers())
     sys.stdout.flush()
 
-    # Always include CPU as a fallback in the provider list (CUDA first)
     providers = [
         ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}),
         "CPUExecutionProvider",
@@ -43,7 +41,6 @@ try:
         providers=providers,
     )
 
-    # Verify models truly ended up on CUDA
     for name, m in face_app.models.items():
         active = m.session.get_providers()
         print(f"Model '{name}' active providers: {active}")
@@ -64,7 +61,18 @@ except Exception:
 
 
 def swap_face(frame, face, source_face):
-    bgr_fake, M = swapper.get(frame, face, source_face, paste_back=True)
+    """
+    InsightFace swapper.get() return signature can vary by version/build.
+    Some return (bgr_fake, M) and others return (bgr_fake, M, extra...).
+    This implementation works for both.
+    """
+    out = swapper.get(frame, face, source_face, paste_back=True)
+
+    if isinstance(out, (tuple, list)):
+        bgr_fake = out[0]
+    else:
+        bgr_fake = out
+
     return np.clip(bgr_fake, 0, 255).astype(np.uint8)
 
 
