@@ -1,6 +1,11 @@
-runpod
-requests
-numpy
-opencv-python-headless
+numpy==1.26.4
+opencv-python-headless==4.9.0.80
+onnxruntime-gpu==1.16.3
 insightface==0.7.3
-onnxruntime-gpu
+pillow
+requests
+tqdm
+runpod
+gfpgan==1.3.8
+basicsr==1.4.2
+facexlib==0.3.0
