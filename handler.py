@@ -1,3 +1,14 @@
+import sys
+# Compatibility patch for Python 3.10 running FaceFusion's Python 3.11+ typing requirements
+try:
+    import typing_extensions
+    if not hasattr(sys.modules.get('typing', typing), 'NotRequired'):
+        import typing
+        typing.NotRequired = typing_extensions.NotRequired
+        typing.Required = typing_extensions.Required
+except Exception:
+    pass
+
 import os
 import subprocess
 import base64
