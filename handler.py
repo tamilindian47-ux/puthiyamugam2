@@ -6,6 +6,7 @@ import base64
 import traceback
 import subprocess
 import urllib.request
+import tempfile
 import numpy as np
 import onnxruntime as ort
 import insightface
@@ -32,8 +33,9 @@ try:
     )
     face_app.prepare(ctx_id=0, det_thresh=0.35, det_size=(640, 640))
 
+    # Updated to look for the file with the underscore matching your checkpoint path
     swapper = insightface.model_zoo.get_model(
-        "/app/models/inswapper128.onnx", download=False, providers=providers
+        "/app/models/inswapper_128.onnx", download=False, providers=providers
     )
     occ_session = ort.InferenceSession("/app/models/face_occluder.onnx", providers=providers)
     enh_session = ort.InferenceSession("/app/models/enhancer.onnx", providers=providers)
