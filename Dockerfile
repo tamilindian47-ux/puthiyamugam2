@@ -5,16 +5,15 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Install system dependencies including libcudnn8 explicitly to satisfy ONNX Runtime CUDA provider
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg libgl1 libglib2.0-0 wget curl unzip \
-    libcudnn8 libcudnn8-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Use modern onnxruntime-gpu which manages its own CUDA/cuDNN wheel dependencies cleanly
 RUN python3 -m pip install --no-cache-dir --upgrade pip && \
     python3 -m pip install --no-cache-dir "numpy==1.26.4" cython && \
     python3 -m pip install --no-cache-dir \
-        "onnxruntime-gpu==1.18.1" \
+        "onnxruntime-gpu==1.22.0" \
         insightface==0.7.3 \
         opencv-python-headless pillow requests tqdm runpod
 
