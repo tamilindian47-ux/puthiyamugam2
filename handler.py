@@ -47,14 +47,14 @@ if SWAPPER_PATH:
         )
         print(f"Worker: inswapper successfully loaded from {SWAPPER_PATH}")
     except Exception as e:
-        print(f"Worker: failed to load inswapper from path: {e}")
+        print(f"Worker: failed to load inswapper: {e}")
 else:
-    print("Worker ERROR: inswapper model file could not be found in any candidate directory!")
+    print("Worker ERROR: inswapper model file not found in expected locations.")
 
 gfpgan_enhancer = None
 try:
     from gfpgan import GFPGANer
-    gfpgan_path = os.environ.get("GFPGANPATH", "/models/GFPGANv1.4.pth")
+    gfpgan_path = os.environ.get("GFPGANPATH", "/app/models/GFPGANv1.4.pth")
     if os.path.exists(gfpgan_path):
         gfpgan_enhancer = GFPGANer(
             model_path=gfpgan_path,
@@ -67,75 +67,6 @@ try:
 except Exception as e:
     print(f"Worker: GFPGAN unavailable: {e}")
 
-codeformer_enhancer = None
-try:
-    from basicsr.utils import img2tensor, tensor2img
-    from facelib.utils.face_restoration_helper import FaceRestoreHelper
-    from torchvision.transforms.functional import normalize
-    import torch
-    from collections import OrderedDict
-    from basicsr.archs.rrdbnet_arch import RRDBNet
-    from realesrgan import RealESRGANer
-    from CodeFormer.basicsr.archs.codeformer_arch import CodeFormer
-
-    def load_codeformer():
-        global codeformer_enhancer
-        if codeformer_enhancer is not None:
-            return codeformer_enhancer
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        net = CodeFormer(
-            dim_embd=512,
-            codebook_size=1024,
-            n_head=8,
-            n_layers=9,
-            connect_list=["32", "64", "128", "256"]
-        ).to(device)
-
-        ckpt_path = os.environ.get("CODEFORMERPATH", "/models/codeformer.pth")
-        if not os.path.exists(ckpt_path):
-            return None
-
-        checkpoint = torch.load(ckpt_path, map_location=device)
-        if "params_ema" in checkpoint:
-            net.load_state_dict(checkpoint["params_ema"])
-        elif "params" in checkpoint:
-            net.load_state_dict(checkpoint["params"])
-        else:
-            net.load_state_dict(checkpoint)
-        net.eval()
-
-        bg_upsampler = None
-        realesr_path = os.environ.get("REALESRGANPATH", "/models/RealESRGAN_x2plus.pth")
-        if os.path.exists(realesr_path):
-            model = RRDBNet(
-                num_in_ch=3,
-                num_out_ch=3,
-                num_feat=64,
-                num_block=23,
-                num_grow_ch=32,
-                scale=2
-            )
-            bg_upsampler = RealESRGANer(
-                scale=2,
-                model_path=realesr_path,
-                model=model,
-                tile=400,
-                tile_pad=40,
-                pre_pad=0,
-                half=torch.cuda.is_available()
-            )
-
-        codeformer_enhancer = {
-            "device": device,
-            "net": net,
-            "bg_upsampler": bg_upsampler
-        }
-        return codeformer_enhancer
-
-except Exception as e:
-    print(f"Worker: CodeFormer unavailable: {e}")
-
 def strip_data_uri(value: str) -> str:
     if not value:
         return value
@@ -146,17 +77,11 @@ def strip_data_uri(value: str) -> str:
 def resolve_media_to_bytes(media_str: str) -> bytes:
     if not media_str:
         return None
-
     media_str = media_str.strip()
-
     if media_str.startswith("http://") or media_str.startswith("https://"):
-        req = urllib.request.Request(
-            media_str,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
+        req = urllib.request.Request(media_str, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.read()
-
     return base64.b64decode(strip_data_uri(media_str))
 
 def decode_image_bytes(raw_bytes: bytes):
@@ -218,80 +143,17 @@ def apply_gfpgan(img_bgr: np.ndarray):
         return img_bgr
     try:
         _, _, restored = gfpgan_enhancer.enhance(
-            img_bgr,
-            has_aligned=False,
-            only_center_face=False,
-            paste_back=True
+            img_bgr, has_aligned=False, only_center_face=False, paste_back=True
         )
         return restored if restored is not None else img_bgr
     except Exception as e:
         print(f"Worker: GFPGAN failed: {e}")
         return img_bgr
 
-def apply_codeformer(img_bgr: np.ndarray, fidelity=0.7):
-    try:
-        assets = load_codeformer()
-        if assets is None:
-            return img_bgr
-
-        import torch
-        from basicsr.utils import img2tensor, tensor2img
-        from torchvision.transforms.functional import normalize
-        from facelib.utils.face_restoration_helper import FaceRestoreHelper
-
-        device = assets["device"]
-        net = assets["net"]
-        bg_upsampler = assets["bg_upsampler"]
-
-        face_helper = FaceRestoreHelper(
-            upscale_factor=1,
-            face_size=512,
-            crop_ratio=(1, 1),
-            det_model="retinaface_resnet50",
-            save_ext="png",
-            use_parse=True,
-            device=device
-        )
-
-        face_helper.clean_all()
-        face_helper.read_image(img_bgr)
-        face_helper.get_face_landmarks_5(only_center_face=False, resize=640, eye_dist_threshold=5)
-        face_helper.align_warp_face()
-
-        if len(face_helper.cropped_faces) == 0:
-            return img_bgr
-
-        for cropped_face in face_helper.cropped_faces:
-            cropped_face_t = img2tensor(cropped_face / 255.0, bgr2rgb=True, float32=True)
-            normalize(cropped_face_t, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True)
-            cropped_face_t = cropped_face_t.unsqueeze(0).to(device)
-
-            try:
-                with torch.no_grad():
-                    output = net(cropped_face_t, w=fidelity, adain=True)[0]
-                    restored_face = tensor2img(output, rgb2bgr=True, min_max=(-1, 1))
-                restored_face = restored_face.astype("uint8")
-                face_helper.add_restored_face(restored_face)
-            except Exception as e:
-                print(f"Worker: CodeFormer face restore failed: {e}")
-                face_helper.add_restored_face(cropped_face)
-
-        face_helper.get_inverse_affine(None)
-        restored_img = face_helper.paste_faces_to_input_image(
-            upsample_img=None if bg_upsampler is None else img_bgr
-        )
-        return restored_img if restored_img is not None else img_bgr
-
-    except Exception as e:
-        print(f"Worker: CodeFormer failed: {e}")
-        return img_bgr
-
 def apply_enhancer(img_bgr: np.ndarray, pipeline: str) -> np.ndarray:
     pipeline = (pipeline or "fast").lower()
     if "gfpgan" in pipeline:
         return apply_gfpgan(img_bgr)
-    if "codeformer" in pipeline:
-        return apply_codeformer(img_bgr)
     return img_bgr
 
 def prepare_swaps(swaps_input):
@@ -325,7 +187,6 @@ def prepare_swaps(swaps_input):
 def detect_characters(frame):
     faces = faceapp.get(frame)
     characters = []
-
     h, w = frame.shape[:2]
     for idx, face in enumerate(faces):
         bbox = [int(v) for v in face.bbox.tolist()]
@@ -480,12 +341,8 @@ def handler(event):
             frame = extract_first_frame(media_bytes, is_video)
             if frame is None:
                 return {"error": "Could not decode media to scan for faces."}
-
             characters = detect_characters(frame)
-            return {
-                "status": "success",
-                "characters": characters
-            }
+            return {"status": "success", "characters": characters}
 
         if action == "swap":
             swaps_input = jobinput.get("swaps", [])
@@ -503,6 +360,13 @@ def handler(event):
                 return swap_on_image(img, swaps_prepared, pipeline)
 
             return swap_on_video(media_bytes, swaps_prepared, pipeline)
+
+        if action == "info":
+            return {
+                "status": "active",
+                "swapper_loaded": swapper is not None,
+                "swapper_path": SWAPPER_PATH
+            }
 
         return {"error": f"Unknown action: {action}"}
 
