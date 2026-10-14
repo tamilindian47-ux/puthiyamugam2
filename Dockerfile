@@ -13,20 +13,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 libgl1 libsm6 libxext6 libxrender1 \
     && add-apt-repository ppa:deadsnakes/ppa -y \
     && apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 python3.11-dev python3.11-venv \
+    python3.11 python3.11-dev python3.11-venv build-essential \
     && curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py \
     && python3.11 /tmp/get-pip.py \
     && ln -sf /usr/bin/python3.11 /usr/local/bin/python \
     && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+    && python --version \
+    && python -c "from typing import NotRequired; print('NotRequired OK')" \
     && rm -f /tmp/get-pip.py \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY requirements.txt /tmp/requirements.txt
-RUN python --version && python -m pip --version && \
-    python -m pip install --upgrade pip setuptools wheel && \
-    python -m pip install -r /tmp/requirements.txt
+RUN python -m pip install --upgrade pip setuptools wheel
+RUN python -m pip install numpy requests runpod opencv-python-headless
+RUN python -m pip install onnxruntime-gpu
+RUN python -m pip install insightface==0.7.3
 
 RUN git clone --depth 1 https://github.com/facefusion/facefusion.git ${FACEFUSION_PATH}
 
