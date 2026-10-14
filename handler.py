@@ -5,14 +5,20 @@ import tempfile
 import runpod
 import cv2
 import numpy as np
-import insightface
-from insightface.app import FaceAnalysis
 
 print("Worker: Initializing FaceFusion Serverless Handler...")
 
-PROVIDERS = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-faceapp = FaceAnalysis(name="buffalo_l", providers=PROVIDERS)
-faceapp.prepare(ctx_id=0, det_size=(640, 640))
+# Lazy-load faceapp to prevent startup crashes if model paths or downloads take a moment
+_faceapp = None
+def get_faceapp():
+    global _faceapp
+    if _faceapp is None:
+        import insightface
+        from insightface.app import FaceAnalysis
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        _faceapp = FaceAnalysis(name="buffalo_l", providers=providers)
+        _faceapp.prepare(ctx_id=0, det_size=(640, 640))
+    return _faceapp
 
 def resolve_media_to_bytes(media_str: str) -> bytes:
     if not media_str:
@@ -58,7 +64,8 @@ def encode_jpg_b64(img_bgr: np.ndarray) -> str:
     return base64.b64encode(buf).decode("utf-8")
 
 def detect_characters(frame):
-    faces = faceapp.get(frame)
+    app = get_faceapp()
+    faces = app.get(frame)
     characters = []
     h, w = frame.shape[:2]
     for idx, face in enumerate(faces):
@@ -111,7 +118,6 @@ def handler(event):
             if not swaps_input:
                 return {"error": "Missing swaps list."}
 
-            # Save source reference face and target media to temp files for FaceFusion CLI
             target_suffix = ".mp4" if is_video else ".jpg"
             with tempfile.NamedTemporaryFile(delete=False, suffix=target_suffix) as tmp_target:
                 tmp_target.write(media_bytes)
@@ -119,13 +125,11 @@ def handler(event):
 
             output_path = target_path.replace(target_suffix, f"_out{target_suffix}")
             
-            # Write source face image (using the first replacement face supplied)
             source_path = target_path.replace(target_suffix, "_source.jpg")
             source_bytes = resolve_media_to_bytes(swaps_input[0].get("newface"))
             with open(source_path, "wb") as f:
                 f.write(source_bytes)
 
-            # Map user options
             swapper_model = jobinput.get("model", "hyperswap_1c")
             enhancer = jobinput.get("enhancer", "codeformer")
             enhancer_blend = str(jobinput.get("enhancer_blend", 35))
@@ -161,7 +165,6 @@ def handler(event):
             with open(output_path, "rb") as f:
                 output_bytes = f.read()
 
-            # Cleanup temp files
             for p in [target_path, source_path, output_path]:
                 if p and os.path.exists(p):
                     try: os.remove(p)
