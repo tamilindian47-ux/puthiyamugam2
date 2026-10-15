@@ -1,9 +1,14 @@
 runpod
 numpy==1.26.4
-onnxruntime-gpu==1.16.3
+onnxruntime-gpu==1.22.0
+nvidia-cuda-runtime-cu12
+nvidia-cuda-nvrtc-cu12
+nvidia-cublas-cu12
+nvidia-cufft-cu12
+nvidia-curand-cu12
+nvidia-cudnn-cu12==9.*
 insightface==0.7.3
 opencv-python-headless
 pillow
 requests
 tqdm
-typing-extensions>=4.5.0
